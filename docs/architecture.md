@@ -236,7 +236,7 @@ pub trait HistoryStore: Send + Sync {
 - **Passwords**: Hashed with Argon2id in `config/users.toml`.
 - **Browser Sessions**: Opaque 256-bit random session IDs stored in memory/SQLite, delivered as `HttpOnly`, `SameSite=Lax`, `Secure` (when behind HTTPS) cookies.
 - **API Tokens**: Scoped to a specific user (inheriting that user's Role and `allowed_areas`), stored as SHA-256 hashes.
-- **Secrets at Rest**: `config/secrets.toml` stores AES-256-GCM ciphertexts encrypted with `XIAOHE_MASTER_KEY`. Secrets are never returned in plaintext over the REST API (write-only update, masked display) and are injected **only** into the specific Skill that declares them in `skill.toml`.
+- **Secrets Management**: `config/secrets.toml` is written with `0600` permissions, excluded from Git, and supports `${ENV_VAR}` references. Secrets are never returned in plaintext over the REST API (write-only update, masked display) and are injected **only** into the specific Skill that declares them in `skill.toml`.
 
 ---
 
@@ -249,9 +249,8 @@ services:
     ports:
       - "4000:4000"
     environment:
-      - XIAOHE_MASTER_KEY=${XIAOHE_MASTER_KEY}
-      - XIAOHE_STORAGE_BACKEND=sqlite
-      - XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+      - STORAGE_BACKEND=sqlite
+      - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
     volumes:
       - ./config:/config
       - ./data:/data
@@ -264,8 +263,8 @@ services:
     image: ghcr.io/yourorg/xiaohe-runtime:latest
     network_mode: host # Optional: enables LAN broadcast / mDNS discovery for local device Skills
     environment:
-      - XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
-      - XIAOHE_SKILLS_DIR=/skills
+      - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+      - SKILLS_DIR=/skills
     volumes:
       - ./skills:/skills
       - runtime-ipc:/run/xiaohe

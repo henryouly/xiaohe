@@ -71,7 +71,7 @@ type = "area_ref"
 required = false
 description = "Default room/area for discovered entities"
 
-# Sensitive credentials (stored AES-256-GCM encrypted in core's config/secrets.toml)
+# Sensitive credentials (stored in core's 0600-protected config/secrets.toml or via ${ENV_VAR})
 [secrets.miio_token]
 required = true
 description = "32-character hex MiHome device token"

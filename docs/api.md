@@ -88,7 +88,7 @@ Served through the pluggable `HistoryStore` DAL (SQLite by default, InfluxDB whe
 - Response `200`: Full manifest schema (`config` fields, `secrets` keys with `is_set: boolean` — never plaintext), current non-secret config values, and health metadata.
 
 ### `PUT /api/skills/{skill_id}/config`
-Update non-secret configuration and/or write-only secrets (encrypted via AES-256-GCM before saving to `config/secrets.toml`). Automatically reloads the Skill if running.
+Update non-secret configuration and/or write-only secrets (saved atomically with `0600` permissions to `config/secrets.toml`). Automatically reloads the Skill if running.
 - Request: `{ "config": object, "secrets": Record<string, string> }`
 - Response `200`: `{ "ok": true, "reloaded": boolean }`
 
