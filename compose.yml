@@ -7,9 +7,8 @@ services:
     ports:
       - "4000:4000"
     environment:
-      - XIAOHE_MASTER_KEY=${XIAOHE_MASTER_KEY:-change-me-in-production}
-      - XIAOHE_STORAGE_BACKEND=${XIAOHE_STORAGE_BACKEND:-sqlite}
-      - XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-sqlite}
+      - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
     volumes:
       - ./config:/config
       - ./data:/data
@@ -25,8 +24,8 @@ services:
     image: xiaohe-runtime:local
     network_mode: host # Optional: enables LAN broadcast / mDNS discovery for local device Skills
     environment:
-      - XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
-      - XIAOHE_SKILLS_DIR=/skills
+      - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+      - SKILLS_DIR=/skills
     volumes:
       - ./skills:/skills
       - runtime-ipc:/run/xiaohe

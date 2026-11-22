@@ -23,6 +23,6 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 COPY --from=builder /app/target/release/xiaohe /usr/local/bin/xiaohe
 RUN mkdir -p /skills /run/xiaohe /var/cache/uv
 ENV UV_CACHE_DIR=/var/cache/uv
-ENV XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
-ENV XIAOHE_SKILLS_DIR=/skills
+ENV RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+ENV SKILLS_DIR=/skills
 ENTRYPOINT ["/usr/local/bin/xiaohe", "supervisor"]

@@ -13,9 +13,9 @@ Each phase is a self-contained, verifiable deliverable ordered by architectural 
 - Add `Makefile` (`build`, `test`, `lint`, `web-build`, `docker-build`) and GitHub Actions CI (`cargo fmt`, `clippy`, `test`, `tsc`, `vite build`).
 - Author `Dockerfile.core` (`rust:alpine` + `cargo-chef` → `scratch` static binary), `Dockerfile.runtime` (`debian:trixie-slim` + `uv` + `xiaohe supervisor`), and reference `compose.yml`.
 
-### 1.2 TOML Configuration & Encrypted Secrets
+### 1.2 TOML Configuration & Secrets Store
 - Implement typed config loaders and atomic disk writers (temp file + `rename`) for `config/system.toml`, `config/areas.toml`, `config/users.toml`, `config/devices.toml`, and `config/secrets.toml`.
-- Implement AES-256-GCM encryption/decryption helpers (`aes-gcm` + `ring`) keyed by `XIAOHE_MASTER_KEY`.
+- Protect `config/secrets.toml` and `config/users.toml` with `0600` permissions, redacted `Debug`, `.gitignore`, and optional `${ENV_VAR}` resolution (no master key or at-rest encryption required).
 
 ### 1.3 Storage Data Access Layer (DAL)
 - Define the async `HistoryStore` trait (state transitions, numeric sensor samples, range/downsampled queries, automation run audit logs).

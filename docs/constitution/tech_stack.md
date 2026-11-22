@@ -27,7 +27,7 @@ This stack builds on the lean, strongly typed, self-hosted philosophy of `tesla-
 | **Startup Configuration** | `figment` | Merges environment variables with `config/system.toml`, providing defaults and startup validation. |
 | **OpenAPI Documentation** | `utoipa` + `utoipa-swagger-ui` | Derives OpenAPI 3.1 schemas directly from Rust types and `axum` handlers; Swagger UI served at `/docs`. |
 | **Auth & Passwords** | `argon2` + `rand` + `axum-extra` (Cookies) | Argon2id password hashing; `HttpOnly` + `SameSite=Lax` session cookies for browsers; high-entropy Bearer tokens (SHA-256 hashed at rest) for webhooks and API clients. |
-| **Secrets Encryption** | `aes-gcm` + `ring` | AES-256-GCM encryption at rest for Skill credentials, API keys, and ESPHome Noise PSKs; master key supplied via environment variable. |
+| **Secrets Storage** | `config/secrets.toml` (`0600`) + `${ENV_VAR}` | Plain TOML secrets file protected by `0600` permissions, `.gitignore`, redacted logging, write-only REST API, and per-Skill scoped injection; supports `${ENV_VAR}` resolution for Docker secrets / `.env`. |
 | **Structured Logging** | `tracing` + `tracing-subscriber` | Structured span-based logging (JSON in production, compact text in dev) tagged with `entity_id`, `skill_id`, `automation_id`, and `user_id`. |
 | **Error Handling** | `thiserror` + `anyhow` | `thiserror` for exhaustive domain error enums; `anyhow` for application-level error propagation. |
 | **Time & Scheduling** | `chrono` + `chrono-tz` + `cron` | Timezone-aware schedules, sunrise/sunset offsets, `for` duration debouncing, and RFC3339 timestamps. |
@@ -45,7 +45,7 @@ Configuration and historical telemetry are cleanly separated: configuration live
 | Concern | Choice | Rationale |
 |---------|--------|-----------|
 | **Format** | TOML via `toml` | Native to the Rust ecosystem; avoids YAML indentation bugs and implicit boolean coercion (`on`/`off`). Atomic write-back via temp file + `rename`. |
-| **Files** | `config/system.toml`, `config/areas.toml`, `config/users.toml`, `config/devices.toml`, `config/secrets.toml`, `config/automations/*.toml` | Persisted on a Docker volume, easy to inspect or version-control with Git. Sensitive values in `secrets.toml` are encrypted with AES-256-GCM. |
+| **Files** | `config/system.toml`, `config/areas.toml`, `config/users.toml`, `config/devices.toml`, `config/secrets.toml`, `config/automations/*.toml` | Persisted on a Docker volume, easy to inspect or version-control with Git. `secrets.toml` is `.gitignore`d and stored with `0600` permissions (with optional `${ENV_VAR}` references). |
 
 ### History & Telemetry Backends (`HistoryStore` Trait)
 
