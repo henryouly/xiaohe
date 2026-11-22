@@ -62,9 +62,9 @@ A dedicated companion container that hosts third-party Python libraries and mult
 
 | Concern | Choice | Rationale |
 |---------|--------|-----------|
-| **Base Image** | `debian:bookworm-slim` | Compact image with full `glibc`, ensuring prebuilt PyPI wheels with C/Rust extensions (`cryptography`, `python-miio`, `numpy`, etc.) install cleanly without compiling from source. |
+| **Base Image** | `debian:trixie-slim` | Compact Debian 13 image with full `glibc`, ensuring prebuilt PyPI wheels with C/Rust extensions (`cryptography`, `python-miio`, `numpy`, etc.) install cleanly without compiling from source. |
 | **Python Env Manager** | `uv` (Astral) | Ultra-fast dependency resolution and installation; creates an isolated `.venv` per Python Skill so third-party packages never conflict. |
-| **Skill Supervisor** | `xiaohe-supervisor` (lightweight Rust binary) | Scans `/skills`, provisions per-skill `uv` environments, spawns/supervises child processes, enforces health checks and exponential-backoff restarts, and streams `stderr` logs. |
+| **Skill Supervisor** | `xiaohe supervisor` (subcommand of the unified `xiaohe` Rust binary) | Scans `/skills`, provisions per-skill `uv` environments, spawns/supervises child processes, enforces health checks and exponential-backoff restarts, and streams `stderr` logs. |
 | **Core ↔ Supervisor Transport** | JSON-RPC 2.0 over Unix Domain Socket (shared volume, default) or internal Docker TCP | UDS gives minimal latency and zero exposed network ports on a single host; TCP mode allows future multi-host scaling. |
 | **Supervisor ↔ Skill Transport** | JSON-RPC 2.0 over `stdin`/`stdout` (NDJSON) | Simple, MCP/LSP-style language-agnostic wire protocol. Any language (Python, Node, Go, Rust) can implement a Skill simply by reading/writing JSON lines. |
 | **Python Skill SDK** | Lightweight `xiaohe-sdk` helper (optional) | Optional thin async helper for JSON-RPC framing, heartbeats, and typed payloads; trivial Skills can also use pure Python stdlib. |
@@ -95,7 +95,7 @@ Follows `tesla-apiscraper-rs`'s lean, fine-grained reactive frontend architectur
 |---------|--------|-----------|
 | **Orchestration** | Docker Compose (`compose.yml`) | Standard two-container stack: `xiaohe-core` + `xiaohe-runtime`, plus an optional `influxdb` compose profile. |
 | **Core Container** | `scratch` static image (~15–25 MB) | No shell, no Python, minimal attack surface. Mounts `/config`, `/data` (SQLite), and shared socket volume `/run/xiaohe`. |
-| **Runtime Container** | `debian:bookworm-slim` + `uv` + `xiaohe-supervisor` | Mounts `/skills`, `/run/xiaohe`, and `/var/cache/uv`. Supports optional `network_mode: host` for LAN broadcast/mDNS device discovery (e.g., MiHome, Tuya, Hue). |
+| **Runtime Container** | `debian:trixie-slim` + `uv` + `xiaohe supervisor` | Mounts `/skills`, `/run/xiaohe`, and `/var/cache/uv`. Supports optional `network_mode: host` for LAN broadcast/mDNS device discovery (e.g., MiHome, Tuya, Hue). |
 | **Port** | `4000` (Web UI, REST, SSE, Webhooks) | Single port for simple reverse-proxy setups (Caddy, Nginx, Tailscale). |
 | **Health Checks** | `GET /health` (liveness) & `GET /health/ready` (readiness: Storage + Runtime bridge) | Standard Docker and orchestrator health probes. |
 

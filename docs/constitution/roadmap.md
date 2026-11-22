@@ -8,10 +8,10 @@ Each phase is a self-contained, verifiable deliverable ordered by architectural 
 
 **Goal:** A working two-container scaffold where `xiaohe-core` loads TOML configs, initializes the default SQLite `HistoryStore`, and passes health checks.
 
-### 1.1 Workspace & Build Scaffolding
-- Initialize Cargo workspace: `crates/xiaohe-core`, `crates/xiaohe-protocol` (shared domain & JSON-RPC types), `crates/xiaohe-supervisor`.
+### 1.1 Project & Build Scaffolding
+- Initialize single-crate Rust project `xiaohe` with `src/protocol` (shared domain & JSON-RPC types), `xiaohe core`, and `xiaohe supervisor` CLI subcommands.
 - Add `Makefile` (`build`, `test`, `lint`, `web-build`, `docker-build`) and GitHub Actions CI (`cargo fmt`, `clippy`, `test`, `tsc`, `vite build`).
-- Author `Dockerfile.core` (`cargo-chef` → `scratch` static binary), `Dockerfile.runtime` (`debian:bookworm-slim` + `uv` + `xiaohe-supervisor`), and reference `compose.yml`.
+- Author `Dockerfile.core` (`rust:alpine` + `cargo-chef` → `scratch` static binary), `Dockerfile.runtime` (`debian:trixie-slim` + `uv` + `xiaohe supervisor`), and reference `compose.yml`.
 
 ### 1.2 TOML Configuration & Encrypted Secrets
 - Implement typed config loaders and atomic disk writers (temp file + `rename`) for `config/system.toml`, `config/areas.toml`, `config/users.toml`, `config/devices.toml`, and `config/secrets.toml`.

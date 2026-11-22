@@ -1,0 +1,38 @@
+services:
+  xiaohe-core:
+    build:
+      context: .
+      dockerfile: Dockerfile.core
+    image: xiaohe-core:local
+    ports:
+      - "4000:4000"
+    environment:
+      - XIAOHE_MASTER_KEY=${XIAOHE_MASTER_KEY:-change-me-in-production}
+      - XIAOHE_STORAGE_BACKEND=${XIAOHE_STORAGE_BACKEND:-sqlite}
+      - XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+    volumes:
+      - ./config:/config
+      - ./data:/data
+      - runtime-ipc:/run/xiaohe
+    depends_on:
+      - xiaohe-runtime
+    restart: unless-stopped
+
+  xiaohe-runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    image: xiaohe-runtime:local
+    network_mode: host # Optional: enables LAN broadcast / mDNS discovery for local device Skills
+    environment:
+      - XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+      - XIAOHE_SKILLS_DIR=/skills
+    volumes:
+      - ./skills:/skills
+      - runtime-ipc:/run/xiaohe
+      - uv-cache:/var/cache/uv
+    restart: unless-stopped
+
+volumes:
+  runtime-ipc:
+  uv-cache:

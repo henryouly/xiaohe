@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Frontend artifacts
+web/node_modules
+web/dist
+
+# Runtime data & local secrets
+.env
+.env.*
+data/
+*.db
+*.db-wal
+*.db-shm
+config/secrets.toml
+
+# Python / uv caches in local skills
+skills/**/.venv/
+skills/**/__pycache__/
+
+# OS / editor files
+.DS_Store
+*.swp
+*.swo

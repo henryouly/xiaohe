@@ -1,0 +1,14 @@
+.git
+.github
+target
+docs
+data
+config
+skills
+web/node_modules
+web/dist
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
