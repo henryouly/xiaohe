@@ -42,6 +42,13 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to parse sensitive TOML in {path}{location} (details redacted)")]
+    SensitiveParse {
+        path: PathBuf,
+        line: Option<usize>,
+        column: Option<usize>,
+        location: String,
+    },
     #[error("failed to serialize TOML for {path}: {source}")]
     Serialize {
         path: PathBuf,
@@ -74,7 +81,7 @@ impl ConfigStore {
     }
 
     pub fn load_system(&self) -> Result<SystemConfig, ConfigError> {
-        self.load_or_default(SYSTEM_FILE)
+        self.load_or_default(SYSTEM_FILE, false)
     }
 
     pub fn save_system(&self, cfg: &SystemConfig) -> Result<(), ConfigError> {
@@ -82,7 +89,7 @@ impl ConfigStore {
     }
 
     pub fn load_areas(&self) -> Result<AreasConfig, ConfigError> {
-        self.load_or_default(AREAS_FILE)
+        self.load_or_default(AREAS_FILE, false)
     }
 
     pub fn save_areas(&self, cfg: &AreasConfig) -> Result<(), ConfigError> {
@@ -90,7 +97,7 @@ impl ConfigStore {
     }
 
     pub fn load_users(&self) -> Result<UsersConfig, ConfigError> {
-        self.load_or_default(USERS_FILE)
+        self.load_or_default(USERS_FILE, true)
     }
 
     pub fn save_users(&self, cfg: &UsersConfig) -> Result<(), ConfigError> {
@@ -98,7 +105,7 @@ impl ConfigStore {
     }
 
     pub fn load_devices(&self) -> Result<DevicesConfig, ConfigError> {
-        self.load_or_default(DEVICES_FILE)
+        self.load_or_default(DEVICES_FILE, false)
     }
 
     pub fn save_devices(&self, cfg: &DevicesConfig) -> Result<(), ConfigError> {
@@ -106,7 +113,7 @@ impl ConfigStore {
     }
 
     pub fn load_secrets(&self) -> Result<SecretsConfig, ConfigError> {
-        self.load_or_default(SECRETS_FILE)
+        self.load_or_default(SECRETS_FILE, true)
     }
 
     pub fn save_secrets(&self, cfg: &SecretsConfig) -> Result<(), ConfigError> {
@@ -116,6 +123,7 @@ impl ConfigStore {
     fn load_or_default<T: DeserializeOwned + Default>(
         &self,
         filename: &str,
+        sensitive: bool,
     ) -> Result<T, ConfigError> {
         let path = self.config_dir.join(filename);
         let content = match fs::read_to_string(&path) {
@@ -124,7 +132,26 @@ impl ConfigStore {
             Err(source) => return Err(ConfigError::Io { path, source }),
         };
 
-        toml::from_str(&content).map_err(|source| ConfigError::Parse { path, source })
+        toml::from_str(&content).map_err(|source| {
+            if sensitive {
+                let (line, column) = source
+                    .span()
+                    .map(|span| byte_offset_to_line_col(&content, span.start))
+                    .map_or((None, None), |(l, c)| (Some(l), Some(c)));
+                let location = match (line, column) {
+                    (Some(l), Some(c)) => format!(" at line {l}, column {c}"),
+                    _ => String::new(),
+                };
+                ConfigError::SensitiveParse {
+                    path,
+                    line,
+                    column,
+                    location,
+                }
+            } else {
+                ConfigError::Parse { path, source }
+            }
+        })
     }
 
     fn save_toml<T: Serialize>(
@@ -143,16 +170,25 @@ impl ConfigStore {
     }
 }
 
-/// Atomically writes `contents` to `path` via a same-directory temp file + `sync_all` + `rename`.
+/// Atomically writes `contents` to `path` via a same-directory temp file + `sync_all` + `rename`
+/// + directory `sync_all`.
 ///
 /// When `restrict_mode` is `true` on Unix, the file is created with `0600` permissions before
 /// replacing the destination.
 pub fn atomic_write(path: &Path, contents: &str, restrict_mode: bool) -> Result<(), ConfigError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+
+    let dirs_to_sync = missing_dir_ancestors(parent);
     fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
+    for dir in dirs_to_sync {
+        sync_dir(&dir)?;
+    }
 
     let mut temp = NamedTempFile::new_in(parent).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
@@ -191,6 +227,53 @@ pub fn atomic_write(path: &Path, contents: &str, restrict_mode: bool) -> Result<
         source,
     })?;
 
+    sync_dir(parent)?;
+
+    Ok(())
+}
+
+fn byte_offset_to_line_col(content: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(content.len());
+    let prefix = &content[..clamped];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.chars().count(), |(_, tail)| tail.chars().count())
+        + 1;
+    (line, col)
+}
+
+/// Returns newly-to-be-created directories and their existing parent so directory entries created
+/// by `create_dir_all` can be synced for crash durability.
+fn missing_dir_ancestors(target: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cur = target;
+    while !cur.exists() {
+        missing.push(cur.to_path_buf());
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() && p != cur => cur = p,
+            _ => break,
+        }
+    }
+    if !missing.is_empty() && cur.exists() {
+        missing.push(cur.to_path_buf());
+    }
+    missing.reverse();
+    missing
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), ConfigError> {
+    fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|source| ConfigError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
@@ -449,5 +532,75 @@ mod tests {
         assert_eq!(cfg.storage.backend, StorageBackend::InfluxDb);
         assert_eq!(cfg.storage.sqlite.path, "/tmp/test.db");
         assert_eq!(cfg.runtime.socket_path, "/tmp/rpc.sock");
+    }
+
+    #[test]
+    fn empty_storage_backend_env_preserves_configured_backend() {
+        let mut cfg = SystemConfig::default();
+        cfg.storage.backend = StorageBackend::InfluxDb;
+        cfg.apply_env_overrides_with(|key| match key {
+            "STORAGE_BACKEND" => Some(String::new()),
+            _ => None,
+        });
+        assert_eq!(cfg.storage.backend, StorageBackend::InfluxDb);
+    }
+
+    #[test]
+    fn sensitive_parse_errors_redact_credentials() {
+        use std::error::Error;
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = ConfigStore::new(dir.path());
+
+        // Syntax error on line with a secret value
+        let secret_val = "TOP_SECRET_MIIO_TOKEN_987654";
+        fs::write(
+            dir.path().join(SECRETS_FILE),
+            format!("[secrets]\nmiio_token = \"{secret_val}\" bad_syntax\n"),
+        )
+        .expect("write malformed secrets");
+        let err = store
+            .load_secrets()
+            .expect_err("expected sensitive parse error");
+        assert!(matches!(
+            err,
+            ConfigError::SensitiveParse {
+                line: Some(2),
+                column: Some(_),
+                ..
+            }
+        ));
+        assert!(err.source().is_none());
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(display.contains("secrets.toml"));
+        assert!(!display.contains(secret_val));
+        assert!(!debug.contains(secret_val));
+
+        // Type mismatch error on users.toml containing a password hash
+        let hash_val = "$argon2id$SECRET_HASH_SHOULD_NOT_LEAK";
+        fs::write(
+            dir.path().join(USERS_FILE),
+            format!("users = \"{hash_val}\"\n"),
+        )
+        .expect("write malformed users");
+        let err = store
+            .load_users()
+            .expect_err("expected sensitive parse error");
+        assert!(matches!(err, ConfigError::SensitiveParse { .. }));
+        assert!(err.source().is_none());
+        assert!(!err.to_string().contains(hash_val));
+        assert!(!format!("{err:?}").contains(hash_val));
+    }
+
+    #[test]
+    fn atomic_write_creates_and_syncs_nested_directories() {
+        let dir = TempDir::new().expect("tempdir");
+        let nested_config_dir = dir.path().join("nested").join("config");
+        let store = ConfigStore::new(&nested_config_dir);
+
+        let system = SystemConfig::default();
+        store.save_system(&system).expect("save into nested dir");
+        assert_eq!(store.load_system().expect("load from nested dir"), system);
     }
 }

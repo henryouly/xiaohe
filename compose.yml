@@ -7,7 +7,7 @@ services:
     ports:
       - "4000:4000"
     environment:
-      - STORAGE_BACKEND=${STORAGE_BACKEND:-sqlite}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-}
       - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
     volumes:
       - ./config:/config

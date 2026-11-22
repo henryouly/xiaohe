@@ -1,4 +1,7 @@
+use std::process::ExitCode;
+
 use clap::{Parser, Subcommand};
+use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -17,13 +20,22 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     init_tracing();
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Core => xiaohe::core::run().await,
-        Commands::Supervisor => xiaohe::supervisor::run().await,
+        Commands::Core => match xiaohe::core::run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                error!(error = %err, "xiaohe core failed to start");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::Supervisor => {
+            xiaohe::supervisor::run().await;
+            ExitCode::SUCCESS
+        }
     }
 }
 
