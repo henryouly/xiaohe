@@ -1,0 +1,28 @@
+FROM rust:alpine AS chef
+RUN apk add --no-cache musl-dev openssl-dev
+RUN cargo install cargo-chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
+
+FROM debian:trixie-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=builder /app/target/release/xiaohe /usr/local/bin/xiaohe
+RUN mkdir -p /skills /run/xiaohe /var/cache/uv
+ENV UV_CACHE_DIR=/var/cache/uv
+ENV XIAOHE_RUNTIME_SOCKET=/run/xiaohe/rpc.sock
+ENV XIAOHE_SKILLS_DIR=/skills
+ENTRYPOINT ["/usr/local/bin/xiaohe", "supervisor"]

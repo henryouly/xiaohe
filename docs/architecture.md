@@ -5,7 +5,7 @@
 Xiaohe splits the control plane and the untrusted third-party device driver runtime into **two isolated containers** orchestrated via Docker Compose:
 
 1. **`xiaohe-core`** (`scratch` static Rust binary + embedded SolidJS SPA): Owns the authoritative entity state store, in-process event bus, ESPHome Native API client, HTTP Webhook receiver, declarative TOML automation engine, multi-user RBAC, REST/SSE API, and pluggable `HistoryStore` DAL.
-2. **`xiaohe-runtime`** (`debian:bookworm-slim` + `uv` + `xiaohe-supervisor`): Scans `/skills`, provisions per-skill isolated Python virtual environments via `uv`, supervises Skill child processes over `stdin`/`stdout` JSON-RPC 2.0, and bridges them to `xiaohe-core` over a shared Unix Domain Socket (`/run/xiaohe/rpc.sock`).
+2. **`xiaohe-runtime`** (`debian:trixie-slim` + `uv` + `xiaohe supervisor`): Scans `/skills`, provisions per-skill isolated Python virtual environments via `uv`, supervises Skill child processes over `stdin`/`stdout` JSON-RPC 2.0, and bridges them to `xiaohe-core` over a shared Unix Domain Socket (`/run/xiaohe/rpc.sock`).
 
 ```mermaid
 flowchart LR
