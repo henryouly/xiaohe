@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::config::{ConfigError, ConfigStore, StorageBackend};
 use crate::http::{self, AppState};
 use crate::protocol::rpc::PROTOCOL_VERSION;
+use crate::state::{EventBus, StateStore, spawn_history_writer};
 use crate::storage::{HistoryStore, StorageError, build_history_store};
 
 pub const DEFAULT_CONFIG_DIR: &str = "/config";
@@ -43,8 +44,13 @@ pub async fn run() -> Result<(), CoreError> {
     system.apply_env_overrides();
 
     let history = build_history_store(&system.storage).await?;
+    let events = EventBus::new();
+    let state = StateStore::new(events.clone());
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let history_writer_handle =
+        spawn_history_writer(Arc::clone(&history), &events, shutdown_rx.clone());
+
     let retention_days = match system.storage.backend {
         StorageBackend::Sqlite => system.storage.sqlite.retention_days,
         StorageBackend::InfluxDb => 0,
@@ -75,13 +81,21 @@ pub async fn run() -> Result<(), CoreError> {
         "xiaohe core listening"
     );
 
-    let router = http::build_router(AppState { history });
+    let router = http::build_router(AppState {
+        history,
+        state,
+        events,
+    });
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             let _ = shutdown_tx.send(true);
         })
         .await;
+
+    if let Err(err) = history_writer_handle.await {
+        warn!(error = %err, "history writer task exited abnormally");
+    }
 
     if let Some(handle) = pruner_handle
         && let Err(err) = handle.await

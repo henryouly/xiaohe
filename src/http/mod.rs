@@ -8,11 +8,14 @@ use serde::Serialize;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
+use crate::state::{EventBus, StateStore};
 use crate::storage::HistoryStore;
 
 #[derive(Clone)]
 pub struct AppState {
     pub history: Arc<dyn HistoryStore>,
+    pub state: StateStore,
+    pub events: EventBus,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +140,13 @@ mod tests {
     #[tokio::test]
     async fn health_and_ready_return_200_with_healthy_store() {
         let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
-        let app = build_router(AppState { history: store });
+        let events = EventBus::new();
+        let state = StateStore::new(events.clone());
+        let app = build_router(AppState {
+            history: store,
+            state,
+            events,
+        });
 
         let resp = app
             .clone()
@@ -159,8 +168,12 @@ mod tests {
 
     #[tokio::test]
     async fn health_ready_returns_503_when_storage_fails() {
+        let events = EventBus::new();
+        let state = StateStore::new(events.clone());
         let app = build_router(AppState {
             history: Arc::new(FailingStore),
+            state,
+            events,
         });
 
         let ready = app

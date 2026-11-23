@@ -64,6 +64,72 @@ pub enum DomainState {
     },
 }
 
+impl DomainState {
+    /// Returns the canonical snake_case domain name matching the entity_id prefix.
+    pub fn domain_name(&self) -> &'static str {
+        match self {
+            Self::Light { .. } => "light",
+            Self::Switch { .. } => "switch",
+            Self::Climate { .. } => "climate",
+            Self::Sensor { .. } => "sensor",
+            Self::BinarySensor { .. } => "binary_sensor",
+            Self::Cover { .. } => "cover",
+            Self::Lock { .. } => "lock",
+            Self::MediaPlayer { .. } => "media_player",
+            Self::Button { .. } => "button",
+            Self::Custom { .. } => "custom",
+        }
+    }
+
+    /// Returns a concise discrete state label for timeline history storage.
+    pub fn canonical_state_label(&self) -> String {
+        match self {
+            Self::Light { on, .. } | Self::Switch { on } => {
+                if *on { "on" } else { "off" }.to_owned()
+            }
+            Self::Climate { mode, .. } => match mode {
+                ClimateMode::Off => "off",
+                ClimateMode::Heat => "heat",
+                ClimateMode::Cool => "cool",
+                ClimateMode::Auto => "auto",
+                ClimateMode::Dry => "dry",
+                ClimateMode::FanOnly => "fan_only",
+            }
+            .to_owned(),
+            Self::Sensor { value, .. } => match value {
+                SensorValue::Number(n) => n.to_string(),
+                SensorValue::Text(s) => s.clone(),
+            },
+            Self::BinarySensor { active, .. } => if *active { "on" } else { "off" }.to_owned(),
+            Self::Cover { state, .. } => match state {
+                CoverState::Open => "open",
+                CoverState::Opening => "opening",
+                CoverState::Closed => "closed",
+                CoverState::Closing => "closing",
+                CoverState::Stopped => "stopped",
+            }
+            .to_owned(),
+            Self::Lock { state } => match state {
+                LockState::Locked => "locked",
+                LockState::Unlocked => "unlocked",
+                LockState::Jammed => "jammed",
+                LockState::Locking => "locking",
+                LockState::Unlocking => "unlocking",
+            }
+            .to_owned(),
+            Self::MediaPlayer { state, .. } => match state {
+                MediaState::Idle => "idle",
+                MediaState::Playing => "playing",
+                MediaState::Paused => "paused",
+                MediaState::Off => "off",
+            }
+            .to_owned(),
+            Self::Button { .. } => "pressed".to_owned(),
+            Self::Custom { state } => state.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClimateMode {
