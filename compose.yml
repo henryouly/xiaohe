@@ -11,7 +11,7 @@ services:
       - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
     volumes:
       - ./config:/config
-      - ./data:/data
+      - xiaohe-data:/data
       - runtime-ipc:/run/xiaohe
     depends_on:
       - xiaohe-runtime
@@ -33,5 +33,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  xiaohe-data:
   runtime-ipc:
   uv-cache:

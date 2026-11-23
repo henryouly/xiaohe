@@ -13,7 +13,10 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+COPY migrations ./migrations
+RUN cargo build --release --locked \
+    && mkdir -p /rootfs/config /rootfs/data \
+    && chown 10000:10001 /rootfs/config /rootfs/data
 
 # Phase 6: SolidJS SPA (Vite build output goes to /web/dist).
 # FROM node:22-alpine AS web
@@ -25,6 +28,8 @@ RUN cargo build --release --locked
 
 FROM scratch AS runtime
 COPY --from=builder /app/target/release/xiaohe /xiaohe
+COPY --from=builder --chown=10000:10001 /rootfs/config /config
+COPY --from=builder --chown=10000:10001 /rootfs/data /data
 # COPY --from=web /web/dist /web/dist
 # ENV WEB_DIST_DIR=/web/dist
 USER 10000:10001
