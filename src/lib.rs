@@ -1,5 +1,6 @@
 pub mod config;
 pub mod core;
+pub mod esphome;
 pub mod http;
 pub mod protocol;
 pub mod state;

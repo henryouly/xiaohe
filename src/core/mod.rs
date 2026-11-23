@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::{ConfigError, ConfigStore, StorageBackend};
+use crate::esphome::EspHomeManager;
 use crate::http::{self, AppState};
 use crate::protocol::rpc::PROTOCOL_VERSION;
 use crate::state::{EventBus, StateStore, spawn_history_writer};
@@ -42,6 +43,8 @@ pub async fn run() -> Result<(), CoreError> {
 
     let mut system = config_store.load_system()?;
     system.apply_env_overrides();
+    let devices = config_store.load_devices()?;
+    let secrets = config_store.load_secrets()?;
 
     let history = build_history_store(&system.storage).await?;
     let events = EventBus::new();
@@ -50,6 +53,13 @@ pub async fn run() -> Result<(), CoreError> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let history_writer_handle =
         spawn_history_writer(Arc::clone(&history), &events, shutdown_rx.clone());
+
+    let esphome_manager = EspHomeManager::start(
+        &devices.esphome.nodes,
+        &secrets,
+        state.clone(),
+        shutdown_rx.clone(),
+    );
 
     let retention_days = match system.storage.backend {
         StorageBackend::Sqlite => system.storage.sqlite.retention_days,
@@ -77,6 +87,7 @@ pub async fn run() -> Result<(), CoreError> {
         bind = %local_addr,
         storage_backend = ?system.storage.backend,
         retention_days = retention_days,
+        esphome_nodes = esphome_manager.active_node_count(),
         runtime_socket = %system.runtime.socket_path,
         "xiaohe core listening"
     );
@@ -92,6 +103,8 @@ pub async fn run() -> Result<(), CoreError> {
             let _ = shutdown_tx.send(true);
         })
         .await;
+
+    esphome_manager.shutdown().await;
 
     if let Err(err) = history_writer_handle.await {
         warn!(error = %err, "history writer task exited abnormally");

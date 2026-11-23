@@ -34,6 +34,52 @@ impl StateStore {
         &self.events
     }
 
+    /// Register entity metadata discovered from a protocol (e.g., ESPHome `ListEntities` or Skill
+    /// `entity.register`) without emitting a synthetic `EntityStateChanged` for placeholder state.
+    ///
+    /// If the entity already exists (e.g., on reconnect), its metadata (`name`, `device_id`,
+    /// `area_id`, `capabilities`) is refreshed while preserving its last known `state`.
+    pub fn register_entity(&self, mut record: EntityRecord) -> EntityRecord {
+        let mut map = self.entities.write().expect("state store rwlock poisoned");
+        let now = now_unix_ms();
+
+        if let Some(existing) = map.get_mut(&record.entity_id) {
+            let avail_changed = existing.availability != record.availability;
+            existing.device_id = record.device_id;
+            existing.area_id = record.area_id;
+            existing.name = record.name;
+            existing.source = record.source;
+            existing.capabilities = record.capabilities;
+            existing.custom_actions = record.custom_actions;
+            existing.availability = record.availability;
+            existing.last_updated_at = now;
+            let stored = existing.clone();
+            if avail_changed {
+                self.events.publish(CoreEvent::EntityAvailabilityChanged {
+                    entity_id: stored.entity_id.clone(),
+                    area_id: stored.area_id.clone(),
+                    availability: stored.availability,
+                    at: now,
+                });
+            }
+            return stored;
+        }
+
+        record.last_updated_at = now;
+        record.last_changed_at = now;
+        let stored = record.clone();
+        map.insert(record.entity_id.clone(), record);
+
+        self.events.publish(CoreEvent::EntityAvailabilityChanged {
+            entity_id: stored.entity_id.clone(),
+            area_id: stored.area_id.clone(),
+            availability: stored.availability,
+            at: now,
+        });
+
+        stored
+    }
+
     /// Insert a new entity or update an existing one, stamping server-issued Unix ms timestamps
     /// and emitting `EntityStateChanged` / `EntityAvailabilityChanged` events in mutation order.
     pub fn upsert_entity(&self, mut record: EntityRecord) -> EntityRecord {
