@@ -35,71 +35,55 @@ impl StateStore {
     }
 
     /// Insert a new entity or update an existing one, stamping server-issued Unix ms timestamps
-    /// and emitting `EntityStateChanged` / `EntityAvailabilityChanged` events.
+    /// and emitting `EntityStateChanged` / `EntityAvailabilityChanged` events in mutation order.
     pub fn upsert_entity(&self, mut record: EntityRecord) -> EntityRecord {
+        let mut map = self.entities.write().expect("state store rwlock poisoned");
         let now = now_unix_ms();
-        let (state_event, avail_event, stored) = {
-            let mut map = self.entities.write().expect("state store rwlock poisoned");
 
-            let previous = map.get(&record.entity_id).cloned();
-            let is_numeric_sensor = matches!(
-                record.state,
-                DomainState::Sensor {
-                    value: SensorValue::Number(_),
-                    ..
-                }
-            );
+        let previous = map.get(&record.entity_id).cloned();
+        let is_numeric_sensor = matches!(
+            record.state,
+            DomainState::Sensor {
+                value: SensorValue::Number(_),
+                ..
+            }
+        );
 
-            let (state_changed, avail_changed, old_state) = match &previous {
-                Some(prev) => {
-                    let sc = prev.state != record.state;
-                    let ac = prev.availability != record.availability;
-                    record.last_updated_at = now;
-                    record.last_changed_at = if sc { now } else { prev.last_changed_at };
-                    (sc, ac, Some(prev.state.clone()))
-                }
-                None => {
-                    record.last_updated_at = now;
-                    record.last_changed_at = now;
-                    (true, true, None)
-                }
-            };
-
-            let stored = record.clone();
-            map.insert(record.entity_id.clone(), record);
-
-            let state_event = if state_changed || is_numeric_sensor {
-                Some(CoreEvent::EntityStateChanged {
-                    entity_id: stored.entity_id.clone(),
-                    area_id: stored.area_id.clone(),
-                    old_state,
-                    new_state: stored.state.clone(),
-                    extra: stored.extra.clone(),
-                    at: now,
-                })
-            } else {
-                None
-            };
-
-            let avail_event = if avail_changed {
-                Some(CoreEvent::EntityAvailabilityChanged {
-                    entity_id: stored.entity_id.clone(),
-                    area_id: stored.area_id.clone(),
-                    availability: stored.availability,
-                    at: now,
-                })
-            } else {
-                None
-            };
-
-            (state_event, avail_event, stored)
+        let (state_changed, avail_changed, old_state) = match &previous {
+            Some(prev) => {
+                let sc = prev.state != record.state;
+                let ac = prev.availability != record.availability;
+                record.last_updated_at = now;
+                record.last_changed_at = if sc { now } else { prev.last_changed_at };
+                (sc, ac, Some(prev.state.clone()))
+            }
+            None => {
+                record.last_updated_at = now;
+                record.last_changed_at = now;
+                (true, true, None)
+            }
         };
 
-        if let Some(ev) = avail_event {
-            self.events.publish(ev);
+        let stored = record.clone();
+        map.insert(record.entity_id.clone(), record);
+
+        if avail_changed {
+            self.events.publish(CoreEvent::EntityAvailabilityChanged {
+                entity_id: stored.entity_id.clone(),
+                area_id: stored.area_id.clone(),
+                availability: stored.availability,
+                at: now,
+            });
         }
-        if let Some(ev) = state_event {
-            self.events.publish(ev);
+        if state_changed || is_numeric_sensor {
+            self.events.publish(CoreEvent::EntityStateChanged {
+                entity_id: stored.entity_id.clone(),
+                area_id: stored.area_id.clone(),
+                old_state,
+                new_state: stored.state.clone(),
+                extra: stored.extra.clone(),
+                at: now,
+            });
         }
 
         stored
@@ -114,72 +98,56 @@ impl StateStore {
         extra: Option<Map<String, Value>>,
         availability: Option<Availability>,
     ) -> Option<EntityRecord> {
+        let mut map = self.entities.write().expect("state store rwlock poisoned");
+        let entry = map.get_mut(entity_id)?;
         let now = now_unix_ms();
-        let (state_event, avail_event, stored) = {
-            let mut map = self.entities.write().expect("state store rwlock poisoned");
-            let entry = map.get_mut(entity_id)?;
 
-            let old_state = entry.state.clone();
-            let state_changed = old_state != new_state;
-            let is_numeric_sensor = matches!(
-                new_state,
-                DomainState::Sensor {
-                    value: SensorValue::Number(_),
-                    ..
-                }
-            );
-
-            entry.state = new_state;
-            if let Some(extra_map) = extra {
-                entry.extra = extra_map;
+        let old_state = entry.state.clone();
+        let state_changed = old_state != new_state;
+        let is_numeric_sensor = matches!(
+            new_state,
+            DomainState::Sensor {
+                value: SensorValue::Number(_),
+                ..
             }
-            entry.last_updated_at = now;
-            if state_changed {
-                entry.last_changed_at = now;
-            }
+        );
 
-            let avail_changed = if let Some(avail) = availability {
-                let changed = entry.availability != avail;
-                entry.availability = avail;
-                changed
-            } else {
-                false
-            };
+        entry.state = new_state;
+        if let Some(extra_map) = extra {
+            entry.extra = extra_map;
+        }
+        entry.last_updated_at = now;
+        if state_changed {
+            entry.last_changed_at = now;
+        }
 
-            let stored = entry.clone();
-
-            let state_event = if state_changed || is_numeric_sensor {
-                Some(CoreEvent::EntityStateChanged {
-                    entity_id: stored.entity_id.clone(),
-                    area_id: stored.area_id.clone(),
-                    old_state: Some(old_state),
-                    new_state: stored.state.clone(),
-                    extra: stored.extra.clone(),
-                    at: now,
-                })
-            } else {
-                None
-            };
-
-            let avail_event = if avail_changed {
-                Some(CoreEvent::EntityAvailabilityChanged {
-                    entity_id: stored.entity_id.clone(),
-                    area_id: stored.area_id.clone(),
-                    availability: stored.availability,
-                    at: now,
-                })
-            } else {
-                None
-            };
-
-            (state_event, avail_event, stored)
+        let avail_changed = if let Some(avail) = availability {
+            let changed = entry.availability != avail;
+            entry.availability = avail;
+            changed
+        } else {
+            false
         };
 
-        if let Some(ev) = avail_event {
-            self.events.publish(ev);
+        let stored = entry.clone();
+
+        if avail_changed {
+            self.events.publish(CoreEvent::EntityAvailabilityChanged {
+                entity_id: stored.entity_id.clone(),
+                area_id: stored.area_id.clone(),
+                availability: stored.availability,
+                at: now,
+            });
         }
-        if let Some(ev) = state_event {
-            self.events.publish(ev);
+        if state_changed || is_numeric_sensor {
+            self.events.publish(CoreEvent::EntityStateChanged {
+                entity_id: stored.entity_id.clone(),
+                area_id: stored.area_id.clone(),
+                old_state: Some(old_state),
+                new_state: stored.state.clone(),
+                extra: stored.extra.clone(),
+                at: now,
+            });
         }
 
         Some(stored)
@@ -192,30 +160,24 @@ impl StateStore {
         source: &EntitySource,
         availability: Availability,
     ) -> usize {
+        let mut map = self.entities.write().expect("state store rwlock poisoned");
         let now = now_unix_ms();
-        let events_to_publish: Vec<CoreEvent> = {
-            let mut map = self.entities.write().expect("state store rwlock poisoned");
-            let mut pending = Vec::new();
+        let mut count = 0;
 
-            for record in map.values_mut() {
-                if &record.source == source && record.availability != availability {
-                    record.availability = availability;
-                    record.last_updated_at = now;
-                    pending.push(CoreEvent::EntityAvailabilityChanged {
-                        entity_id: record.entity_id.clone(),
-                        area_id: record.area_id.clone(),
-                        availability,
-                        at: now,
-                    });
-                }
+        for record in map.values_mut() {
+            if &record.source == source && record.availability != availability {
+                record.availability = availability;
+                record.last_updated_at = now;
+                self.events.publish(CoreEvent::EntityAvailabilityChanged {
+                    entity_id: record.entity_id.clone(),
+                    area_id: record.area_id.clone(),
+                    availability,
+                    at: now,
+                });
+                count += 1;
             }
-            pending
-        };
-
-        let count = events_to_publish.len();
-        for ev in events_to_publish {
-            self.events.publish(ev);
         }
+
         count
     }
 

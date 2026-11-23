@@ -246,4 +246,260 @@ mod tests {
             other => panic!("expected discrete series, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn history_writer_drains_retained_events_after_broadcast_lag_on_shutdown() {
+        let history = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let bus = EventBus::with_capacity(2);
+        let store = StateStore::new(bus.clone());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_history_writer_with_config(
+            Arc::clone(&history) as Arc<dyn HistoryStore>,
+            &bus,
+            shutdown_rx,
+            64,
+            Duration::from_secs(60),
+        );
+
+        // Publish 4 sensor samples synchronously before yielding so the capacity-2 receiver lags
+        // by 2 events while 2 newer events remain retained in the channel, then signal shutdown.
+        store.upsert_entity(sample_temp_sensor("sensor.lag_test", "living_room", 10.0));
+        for val in [20.0, 30.0, 40.0] {
+            store.update_state(
+                "sensor.lag_test",
+                DomainState::Sensor {
+                    value: SensorValue::Number(val),
+                    unit: Some("°C".into()),
+                    device_class: Some("temperature".into()),
+                },
+                None,
+                None,
+            );
+        }
+        let _ = shutdown_tx.send(true);
+        handle.await.expect("history writer joined");
+
+        let series = history
+            .query_entity_history(
+                "sensor.lag_test",
+                TimeRange::new(0, i64::MAX).unwrap(),
+                None,
+            )
+            .await
+            .expect("query lag_test");
+        match series {
+            EntityHistorySeries::Numeric { points, .. } => {
+                assert_eq!(points.len(), 2, "expected 2 retained events after lag");
+                assert_eq!(points[0].avg, 30.0);
+                assert_eq!(points[1].avg, 40.0);
+            }
+            other => panic!("expected numeric series with retained events, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn history_writer_exits_and_flushes_when_shutdown_sender_is_dropped() {
+        let history = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let bus = EventBus::new();
+        let store = StateStore::new(bus.clone());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_history_writer_with_config(
+            Arc::clone(&history) as Arc<dyn HistoryStore>,
+            &bus,
+            shutdown_rx,
+            64,
+            Duration::from_secs(60),
+        );
+
+        store.upsert_entity(sample_temp_sensor("sensor.drop_test", "living_room", 25.0));
+        // Drop sender without sending `true` (e.g. startup error before serve).
+        drop(shutdown_tx);
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("history writer should exit instead of spinning on closed watch channel")
+            .expect("history writer task should not panic");
+
+        let series = history
+            .query_entity_history(
+                "sensor.drop_test",
+                TimeRange::new(0, i64::MAX).unwrap(),
+                None,
+            )
+            .await
+            .expect("query drop_test");
+        match series {
+            EntityHistorySeries::Numeric { points, .. } => {
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].avg, 25.0);
+            }
+            other => panic!("expected numeric series flushed on sender drop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn history_writer_retains_and_retries_batch_after_transient_write_failure() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+
+        use crate::storage::{AutomationRunRecord, StateHistoryEntry, StorageError};
+
+        struct FlakyStore {
+            attempts: AtomicUsize,
+            saved: Mutex<Vec<StateHistoryEntry>>,
+        }
+
+        #[async_trait]
+        impl HistoryStore for FlakyStore {
+            async fn health_check(&self) -> Result<(), StorageError> {
+                Ok(())
+            }
+
+            async fn record_state_batch(
+                &self,
+                records: &[StateHistoryEntry],
+            ) -> Result<(), StorageError> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(StorageError::Query("transient sqlite busy".into()));
+                }
+                self.saved.lock().unwrap().extend_from_slice(records);
+                Ok(())
+            }
+
+            async fn record_automation_run(
+                &self,
+                _run: &AutomationRunRecord,
+            ) -> Result<(), StorageError> {
+                unimplemented!()
+            }
+
+            async fn query_entity_history(
+                &self,
+                _entity_id: &str,
+                _range: TimeRange,
+                _bucket_seconds: Option<u32>,
+            ) -> Result<EntityHistorySeries, StorageError> {
+                unimplemented!()
+            }
+
+            async fn query_automation_runs(
+                &self,
+                _automation_id: Option<&str>,
+                _limit: u32,
+                _offset: u32,
+            ) -> Result<Vec<AutomationRunRecord>, StorageError> {
+                unimplemented!()
+            }
+
+            async fn prune_before(&self, _cutoff_unix_ms: i64) -> Result<u64, StorageError> {
+                unimplemented!()
+            }
+        }
+
+        let flaky = Arc::new(FlakyStore {
+            attempts: AtomicUsize::new(0),
+            saved: Mutex::new(Vec::new()),
+        });
+        let bus = EventBus::new();
+        let store = StateStore::new(bus.clone());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_history_writer_with_config(
+            Arc::clone(&flaky) as Arc<dyn HistoryStore>,
+            &bus,
+            shutdown_rx,
+            1, // Flush immediately on 1st event (fails), then retry on 20ms tick
+            Duration::from_millis(20),
+        );
+
+        store.upsert_entity(sample_temp_sensor("sensor.flaky", "living_room", 23.0));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = shutdown_tx.send(true);
+        handle.await.expect("history writer joined");
+
+        let saved = flaky.saved.lock().unwrap();
+        assert_eq!(
+            saved.len(),
+            1,
+            "failed batch should be retained and persisted on retry"
+        );
+        assert_eq!(saved[0].entity_id, "sensor.flaky");
+    }
+
+    #[test]
+    fn state_store_publishes_events_in_strict_mutation_order() {
+        use std::sync::Barrier;
+
+        let bus = EventBus::with_capacity(8192);
+        let mut rx = bus.subscribe();
+        let store = StateStore::new(bus);
+
+        store.upsert_entity(sample_light(
+            "light.race",
+            "living_room",
+            "esp32_living",
+            false,
+        ));
+        while rx.try_recv().is_ok() {}
+
+        let num_threads = 8;
+        let barrier = Arc::new(Barrier::new(num_threads));
+        let mut threads = Vec::new();
+        for t in 0..num_threads as u8 {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..500_u16 {
+                    let brightness = t.wrapping_mul(31).wrapping_add((i % 31) as u8);
+                    store.update_state(
+                        "light.race",
+                        DomainState::Light {
+                            on: (i % 2) == 0,
+                            brightness: Some(brightness),
+                            color_temp_k: Some(2700 + i),
+                            rgb: None,
+                        },
+                        None,
+                        None,
+                    );
+                }
+            }));
+        }
+        for th in threads {
+            th.join().expect("thread joined");
+        }
+
+        // Verify every published EntityStateChanged forms a contiguous causal chain:
+        // each event's old_state must equal the previous event's new_state, and the final
+        // event's new_state must equal the current state stored in StateStore.
+        let mut prev_new_state: Option<DomainState> = None;
+        let mut count = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::EntityStateChanged {
+                old_state,
+                new_state,
+                ..
+            } = ev
+            {
+                if let Some(expected_old) = &prev_new_state {
+                    assert_eq!(
+                        old_state.as_ref(),
+                        Some(expected_old),
+                        "out-of-order state event published after lock release"
+                    );
+                }
+                prev_new_state = Some(new_state);
+                count += 1;
+            }
+        }
+        assert!(count > 0);
+        let final_stored = store.get("light.race").unwrap().state;
+        assert_eq!(prev_new_state, Some(final_stored));
+    }
 }

@@ -126,8 +126,8 @@ fn spawn_retention_pruner(
                 _ = interval.tick() => {
                     prune_expired(&*history, retention_days).await;
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed_res = shutdown_rx.changed() => {
+                    if changed_res.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
                 }
