@@ -51,9 +51,17 @@ impl SqliteStore {
                 .busy_timeout(Duration::from_secs(5))
         };
 
-        let max_conns = if is_memory { 1 } else { 8 };
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_conns)
+        let mut pool_opts = SqlitePoolOptions::new();
+        if is_memory {
+            pool_opts = pool_opts
+                .max_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None);
+        } else {
+            pool_opts = pool_opts.max_connections(8);
+        }
+
+        let pool = pool_opts
             .connect_with(options)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
@@ -165,18 +173,51 @@ impl HistoryStore for SqliteStore {
             ));
         }
 
-        let numeric_meta = sqlx::query(
-            "SELECT unit FROM numeric_telemetry WHERE entity_id = ?1 ORDER BY ts DESC LIMIT 1",
+        let numeric_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM numeric_telemetry WHERE entity_id = ?1 AND ts >= ?2 AND ts <= ?3",
         )
         .bind(entity_id)
-        .fetch_optional(&self.pool)
+        .bind(range.from_ms)
+        .bind(range.to_ms)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| StorageError::Query(e.to_string()))?;
 
-        if let Some(meta_row) = numeric_meta {
-            let unit: Option<String> = meta_row
-                .try_get("unit")
-                .map_err(|e| StorageError::Query(e.to_string()))?;
+        let discrete_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entity_state_history WHERE entity_id = ?1 AND ts >= ?2 AND ts <= ?3",
+        )
+        .bind(entity_id)
+        .bind(range.from_ms)
+        .bind(range.to_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+
+        if numeric_count > 0 && discrete_count > 0 {
+            return Err(StorageError::Query(format!(
+                "entity '{entity_id}' has mixed numeric and discrete history in the requested window"
+            )));
+        }
+
+        if numeric_count > 0 {
+            let distinct_units: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT unit FROM numeric_telemetry \
+                 WHERE entity_id = ?1 AND ts >= ?2 AND ts <= ?3 AND unit IS NOT NULL",
+            )
+            .bind(entity_id)
+            .bind(range.from_ms)
+            .bind(range.to_ms)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+
+            if distinct_units.len() > 1 {
+                return Err(StorageError::Query(format!(
+                    "entity '{entity_id}' has mixed units ({}) in the requested window",
+                    distinct_units.join(", ")
+                )));
+            }
+            let unit = distinct_units.into_iter().next();
 
             let points = if let Some(secs) = bucket_seconds {
                 let bucket_ms = i64::from(secs) * 1000;
@@ -237,6 +278,25 @@ impl HistoryStore for SqliteStore {
                 unit,
                 points,
             });
+        }
+
+        if discrete_count == 0 {
+            let latest_numeric = sqlx::query(
+                "SELECT unit FROM numeric_telemetry WHERE entity_id = ?1 ORDER BY ts DESC LIMIT 1",
+            )
+            .bind(entity_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+
+            if let Some(meta_row) = latest_numeric {
+                let unit: Option<String> = meta_row.try_get("unit").map_err(query_err)?;
+                return Ok(EntityHistorySeries::Numeric {
+                    entity_id: entity_id.to_owned(),
+                    unit,
+                    points: Vec::new(),
+                });
+            }
         }
 
         let rows = sqlx::query(
@@ -598,5 +658,91 @@ mod tests {
             .await
             .expect_err("expected invalid bucket_seconds");
         assert!(matches!(err, StorageError::InvalidQuery(_)));
+    }
+
+    #[tokio::test]
+    async fn window_scoped_kind_and_unit_resolution() {
+        let store = SqliteStore::open(":memory:").await.expect("open memory db");
+
+        store
+            .record_state_batch(&[
+                // Earlier window in °C, later window in °F
+                StateHistoryEntry {
+                    entity_id: "sensor.outdoor".into(),
+                    ts: 1_000,
+                    kind: HistoryEntryKind::Numeric {
+                        value: 20.0,
+                        unit: Some("°C".into()),
+                    },
+                },
+                StateHistoryEntry {
+                    entity_id: "sensor.outdoor".into(),
+                    ts: 5_000,
+                    kind: HistoryEntryKind::Numeric {
+                        value: 68.0,
+                        unit: Some("°F".into()),
+                    },
+                },
+                // Discrete in earlier window, numeric in later window
+                StateHistoryEntry {
+                    entity_id: "sensor.mode".into(),
+                    ts: 1_000,
+                    kind: HistoryEntryKind::Discrete {
+                        state: "auto".into(),
+                        attributes: None,
+                    },
+                },
+                StateHistoryEntry {
+                    entity_id: "sensor.mode".into(),
+                    ts: 5_000,
+                    kind: HistoryEntryKind::Numeric {
+                        value: 2.0,
+                        unit: None,
+                    },
+                },
+            ])
+            .await
+            .expect("record batch");
+
+        // Earlier window returns °C, not overwritten by later °F
+        let early = store
+            .query_entity_history("sensor.outdoor", TimeRange::new(0, 2_000).unwrap(), None)
+            .await
+            .expect("early numeric");
+        match early {
+            EntityHistorySeries::Numeric { unit, points, .. } => {
+                assert_eq!(unit.as_deref(), Some("°C"));
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].avg, 20.0);
+            }
+            other => panic!("expected numeric, got {other:?}"),
+        }
+
+        // Overlapping window with both °C and °F is rejected
+        let mixed_units = store
+            .query_entity_history("sensor.outdoor", TimeRange::new(0, 10_000).unwrap(), None)
+            .await
+            .expect_err("expected mixed units error");
+        assert!(matches!(mixed_units, StorageError::Query(_)));
+
+        // Earlier window returns discrete even though numeric exists outside the window
+        let discrete = store
+            .query_entity_history("sensor.mode", TimeRange::new(0, 2_000).unwrap(), None)
+            .await
+            .expect("early discrete");
+        match discrete {
+            EntityHistorySeries::Discrete { transitions, .. } => {
+                assert_eq!(transitions.len(), 1);
+                assert_eq!(transitions[0].state, "auto");
+            }
+            other => panic!("expected discrete, got {other:?}"),
+        }
+
+        // Overlapping window with both discrete and numeric is rejected
+        let mixed_kinds = store
+            .query_entity_history("sensor.mode", TimeRange::new(0, 10_000).unwrap(), None)
+            .await
+            .expect_err("expected mixed kinds error");
+        assert!(matches!(mixed_kinds, StorageError::Query(_)));
     }
 }
