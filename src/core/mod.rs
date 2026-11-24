@@ -61,6 +61,15 @@ pub async fn run() -> Result<(), CoreError> {
         shutdown_rx.clone(),
     );
 
+    let skill_bridge = crate::skills::SkillBridge::start(
+        &system.runtime.socket_path,
+        devices.skills,
+        secrets,
+        state.clone(),
+        events.clone(),
+        shutdown_rx.clone(),
+    );
+
     let retention_days = match system.storage.backend {
         StorageBackend::Sqlite => system.storage.sqlite.retention_days,
         StorageBackend::InfluxDb => 0,
@@ -97,6 +106,7 @@ pub async fn run() -> Result<(), CoreError> {
         state,
         events,
         webhooks: Arc::new(system.webhooks),
+        skills: Some(skill_bridge.clone()),
     });
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -105,6 +115,7 @@ pub async fn run() -> Result<(), CoreError> {
         })
         .await;
 
+    skill_bridge.shutdown().await;
     esphome_manager.shutdown().await;
 
     if let Err(err) = history_writer_handle.await {

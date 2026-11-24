@@ -264,37 +264,24 @@ impl SupervisorManager {
         Ok(managed.logs.tail(tail.min(DEFAULT_LOG_RING_CAPACITY)))
     }
 
+    /// Prepare a lock-free reinstall task so callers holding a mutex on `SupervisorManager` can
+    /// drop the lock before running `uv sync` / `uv venv`.
+    pub fn prepare_reinstall(&self, skill_id: &str) -> Result<PreparedReinstall, SupervisorError> {
+        let managed = self
+            .skills
+            .get(skill_id)
+            .ok_or_else(|| SupervisorError::UnknownSkill(skill_id.to_owned()))?;
+        Ok(PreparedReinstall {
+            skill_id: skill_id.to_owned(),
+            discovered: managed.discovered.clone(),
+            state: Arc::clone(&managed.state),
+            events_tx: self.events_tx.clone(),
+        })
+    }
+
     /// Re-run `uv sync` / `uv venv` for a skill.
     pub async fn reinstall_skill(&mut self, skill_id: &str) -> Result<(), SupervisorError> {
-        let (discovered, state, events_tx) = {
-            let managed = self
-                .skills
-                .get(skill_id)
-                .ok_or_else(|| SupervisorError::UnknownSkill(skill_id.to_owned()))?;
-            (
-                managed.discovered.clone(),
-                Arc::clone(&managed.state),
-                self.events_tx.clone(),
-            )
-        };
-
-        set_skill_status(&state, &events_tx, skill_id, SkillStatus::Installing, None);
-        match provision_skill_env(&discovered, true).await {
-            Ok(_) => {
-                set_skill_status(&state, &events_tx, skill_id, SkillStatus::Stopped, None);
-                Ok(())
-            }
-            Err(err) => {
-                set_skill_status(
-                    &state,
-                    &events_tx,
-                    skill_id,
-                    SkillStatus::Error,
-                    Some(err.to_string()),
-                );
-                Err(SupervisorError::Env(err))
-            }
-        }
+        self.prepare_reinstall(skill_id)?.execute().await
     }
 
     /// Start (or restart) a long-running `mode = "device"` skill.
@@ -372,12 +359,11 @@ impl SupervisorManager {
         Ok(())
     }
 
-    /// Send an `entity.command` JSON-RPC request to a running `device` skill.
-    pub async fn send_entity_command(
+    /// Prepare a lock-free `entity.command` handle for a running `device` skill.
+    pub fn prepare_entity_command(
         &self,
         skill_id: &str,
-        params: EntityCommandParams,
-    ) -> Result<Value, SupervisorError> {
+    ) -> Result<PreparedEntityCommand, SupervisorError> {
         let managed = self
             .skills
             .get(skill_id)
@@ -388,25 +374,45 @@ impl SupervisorManager {
             .running
             .as_ref()
             .ok_or_else(|| SupervisorError::NotRunning(skill_id.to_owned()))?;
+        Ok(PreparedEntityCommand {
+            skill_id: skill_id.to_owned(),
+            cmd_tx: handle.cmd_tx.clone(),
+            invoke_timeout,
+        })
+    }
 
-        let (ack_tx, ack_rx) = oneshot::channel();
-        handle
-            .cmd_tx
-            .send(DeviceActorCommand::EntityCommand {
-                params,
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::NotRunning(skill_id.to_owned()))?;
+    /// Send an `entity.command` JSON-RPC request to a running `device` skill.
+    pub async fn send_entity_command(
+        &self,
+        skill_id: &str,
+        params: EntityCommandParams,
+    ) -> Result<Value, SupervisorError> {
+        self.prepare_entity_command(skill_id)?.execute(params).await
+    }
 
-        match tokio::time::timeout(invoke_timeout, ack_rx).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(_)) => Err(SupervisorError::NotRunning(skill_id.to_owned())),
-            Err(_) => Err(SupervisorError::Timeout(
+    /// Prepare a lock-free on-demand `mode = "action"` skill invocation.
+    pub fn prepare_action_invoke(
+        &self,
+        skill_id: &str,
+    ) -> Result<PreparedActionInvoke, SupervisorError> {
+        let managed = self
+            .skills
+            .get(skill_id)
+            .ok_or_else(|| SupervisorError::UnknownSkill(skill_id.to_owned()))?;
+        if managed.discovered.manifest.skill.mode != SkillMode::Action {
+            return Err(SupervisorError::ModeMismatch(
                 skill_id.to_owned(),
-                "entity.command timeout".into(),
-            )),
+                "invoke_action_skill requires mode = \"action\"".to_owned(),
+            ));
         }
+        Ok(PreparedActionInvoke {
+            skill_id: skill_id.to_owned(),
+            discovered: managed.discovered.clone(),
+            state: Arc::clone(&managed.state),
+            logs: managed.logs.clone(),
+            events_tx: self.events_tx.clone(),
+            timing: self.timing,
+        })
     }
 
     /// Execute an on-demand `mode = "action"` skill (`skill.init` -> `skill.invoke` -> `skill.shutdown`).
@@ -417,33 +423,127 @@ impl SupervisorManager {
         secrets: BTreeMap<String, String>,
         params: SkillInvokeParams,
     ) -> Result<Value, SupervisorError> {
-        let (discovered, state, logs, events_tx, timing) = {
-            let managed = self
-                .skills
-                .get(skill_id)
-                .ok_or_else(|| SupervisorError::UnknownSkill(skill_id.to_owned()))?;
-            if managed.discovered.manifest.skill.mode != SkillMode::Action {
-                return Err(SupervisorError::ModeMismatch(
-                    skill_id.to_owned(),
-                    "invoke_action_skill requires mode = \"action\"".to_owned(),
-                ));
-            }
-            (
-                managed.discovered.clone(),
-                Arc::clone(&managed.state),
-                managed.logs.clone(),
-                self.events_tx.clone(),
-                self.timing,
-            )
-        };
+        self.prepare_action_invoke(skill_id)?
+            .execute(config, secrets, params)
+            .await
+    }
 
-        set_skill_status(&state, &events_tx, skill_id, SkillStatus::Installing, None);
-        let resolved = match provision_skill_env(&discovered, false).await {
+    /// Stop all running device skills cleanly.
+    pub async fn stop_all(&mut self) {
+        let ids: Vec<String> = self
+            .skills
+            .iter()
+            .filter(|(_, m)| m.running.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let _ = self.stop_skill(&id).await;
+        }
+    }
+}
+
+/// Lock-free handle for re-provisioning a skill's virtual environment.
+pub struct PreparedReinstall {
+    skill_id: String,
+    discovered: DiscoveredSkill,
+    state: Arc<Mutex<SharedSkillState>>,
+    events_tx: mpsc::UnboundedSender<SupervisorEvent>,
+}
+
+impl PreparedReinstall {
+    pub async fn execute(self) -> Result<(), SupervisorError> {
+        set_skill_status(
+            &self.state,
+            &self.events_tx,
+            &self.skill_id,
+            SkillStatus::Installing,
+            None,
+        );
+        match provision_skill_env(&self.discovered, true).await {
+            Ok(_) => {
+                set_skill_status(
+                    &self.state,
+                    &self.events_tx,
+                    &self.skill_id,
+                    SkillStatus::Stopped,
+                    None,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                set_skill_status(
+                    &self.state,
+                    &self.events_tx,
+                    &self.skill_id,
+                    SkillStatus::Error,
+                    Some(err.to_string()),
+                );
+                Err(SupervisorError::Env(err))
+            }
+        }
+    }
+}
+
+/// Lock-free handle for dispatching an `entity.command` to a running `device` skill.
+pub struct PreparedEntityCommand {
+    skill_id: String,
+    cmd_tx: mpsc::Sender<DeviceActorCommand>,
+    invoke_timeout: Duration,
+}
+
+impl PreparedEntityCommand {
+    pub async fn execute(self, params: EntityCommandParams) -> Result<Value, SupervisorError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DeviceActorCommand::EntityCommand {
+                params,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| SupervisorError::NotRunning(self.skill_id.clone()))?;
+
+        match tokio::time::timeout(self.invoke_timeout, ack_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(SupervisorError::NotRunning(self.skill_id)),
+            Err(_) => Err(SupervisorError::Timeout(
+                self.skill_id,
+                "entity.command timeout".into(),
+            )),
+        }
+    }
+}
+
+/// Lock-free handle for running an on-demand `action` skill invocation.
+pub struct PreparedActionInvoke {
+    skill_id: String,
+    discovered: DiscoveredSkill,
+    state: Arc<Mutex<SharedSkillState>>,
+    logs: LogRingBuffer,
+    events_tx: mpsc::UnboundedSender<SupervisorEvent>,
+    timing: SupervisorTimingConfig,
+}
+
+impl PreparedActionInvoke {
+    pub async fn execute(
+        self,
+        config: Map<String, Value>,
+        secrets: BTreeMap<String, String>,
+        params: SkillInvokeParams,
+    ) -> Result<Value, SupervisorError> {
+        let skill_id = &self.skill_id;
+        set_skill_status(
+            &self.state,
+            &self.events_tx,
+            skill_id,
+            SkillStatus::Installing,
+            None,
+        );
+        let resolved = match provision_skill_env(&self.discovered, false).await {
             Ok(cmd) => cmd,
             Err(err) => {
                 set_skill_status(
-                    &state,
-                    &events_tx,
+                    &self.state,
+                    &self.events_tx,
                     skill_id,
                     SkillStatus::Error,
                     Some(err.to_string()),
@@ -452,18 +552,25 @@ impl SupervisorManager {
             }
         };
 
-        let mut proc = spawn_skill_process(skill_id, &resolved, logs.clone())?;
-        set_skill_status(&state, &events_tx, skill_id, SkillStatus::Running, None);
+        let mut proc = spawn_skill_process(skill_id, &resolved, self.logs.clone())?;
+        set_skill_status(
+            &self.state,
+            &self.events_tx,
+            skill_id,
+            SkillStatus::Running,
+            None,
+        );
 
-        let invoke_timeout = Duration::from_secs(discovered.manifest.runtime.invoke_timeout_secs);
+        let invoke_timeout =
+            Duration::from_secs(self.discovered.manifest.runtime.invoke_timeout_secs);
         let outcome = async {
             perform_init_handshake(
                 &mut proc,
                 skill_id,
                 config,
                 secrets,
-                timing.init_timeout,
-                &events_tx,
+                self.timing.init_timeout,
+                &self.events_tx,
             )
             .await?;
 
@@ -482,19 +589,25 @@ impl SupervisorManager {
                 skill_id,
                 &RpcId::Number(2),
                 invoke_timeout,
-                &events_tx,
+                &self.events_tx,
             )
             .await
         }
         .await;
 
-        proc.shutdown(timing.shutdown_grace).await;
+        proc.shutdown(self.timing.shutdown_grace).await;
 
         match &outcome {
-            Ok(_) => set_skill_status(&state, &events_tx, skill_id, SkillStatus::Stopped, None),
+            Ok(_) => set_skill_status(
+                &self.state,
+                &self.events_tx,
+                skill_id,
+                SkillStatus::Stopped,
+                None,
+            ),
             Err(err) => set_skill_status(
-                &state,
-                &events_tx,
+                &self.state,
+                &self.events_tx,
                 skill_id,
                 SkillStatus::Error,
                 Some(err.to_string()),
@@ -502,19 +615,6 @@ impl SupervisorManager {
         }
 
         outcome
-    }
-
-    /// Stop all running device skills cleanly.
-    pub async fn stop_all(&mut self) {
-        let ids: Vec<String> = self
-            .skills
-            .iter()
-            .filter(|(_, m)| m.running.is_some())
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in ids {
-            let _ = self.stop_skill(&id).await;
-        }
     }
 }
 

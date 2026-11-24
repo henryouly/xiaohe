@@ -184,3 +184,83 @@ pub struct SkillInvokeParams {
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub context: Map<String, Value>,
 }
+
+/// Parameters for `supervisor.start_skill` (Core -> Supervisor over UDS).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorStartSkillParams {
+    pub skill_id: String,
+    #[serde(default)]
+    pub config: Map<String, Value>,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+}
+
+/// Parameters for `supervisor.stop_skill` / `supervisor.reinstall_skill` (Core -> Supervisor).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorSkillIdParams {
+    pub skill_id: String,
+}
+
+/// Parameters for `supervisor.get_logs` (Core -> Supervisor).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorGetLogsParams {
+    pub skill_id: String,
+    #[serde(default = "default_log_tail")]
+    pub tail: usize,
+}
+
+/// Parameters for `supervisor.entity_command` (Core -> Supervisor).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorEntityCommandParams {
+    pub skill_id: String,
+    pub command: EntityCommandParams,
+}
+
+/// Parameters for `supervisor.invoke_skill` (Core -> Supervisor).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorInvokeSkillParams {
+    pub skill_id: String,
+    #[serde(default)]
+    pub config: Map<String, Value>,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+    pub invoke: SkillInvokeParams,
+}
+
+/// Parameters for `skill.status_changed` notification (Supervisor -> Core).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillStatusChangedParams {
+    pub skill_id: String,
+    pub status: crate::protocol::skill::SkillStatus,
+    pub restart_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Parameters for `skill.event` notification forwarding a Skill's notification to Core.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillForwardedEventParams {
+    pub skill_id: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+/// Parameters for `core.get_entity` callback (Skill -> Supervisor -> Core).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreGetEntityParams {
+    pub entity_id: String,
+}
+
+/// Parameters for `core.call_entity` callback (Skill -> Supervisor -> Core).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreCallEntityParams {
+    pub entity_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub params: Map<String, Value>,
+}
+
+fn default_log_tail() -> usize {
+    100
+}

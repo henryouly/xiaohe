@@ -1,10 +1,12 @@
 pub mod env;
 pub mod manifest;
 pub mod process;
+pub mod uds;
 
 use std::env as std_env;
+use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tracing::{info, warn};
 
 use crate::protocol::rpc::PROTOCOL_VERSION;
@@ -13,17 +15,18 @@ pub use process::{
     DEFAULT_LOG_RING_CAPACITY, LogEntry, LogRingBuffer, SkillRuntimeSummary, SupervisorError,
     SupervisorEvent, SupervisorManager, SupervisorTimingConfig,
 };
+pub use uds::run_uds_server;
 
 pub const DEFAULT_RUNTIME_SOCKET: &str = "/run/xiaohe/rpc.sock";
 pub const DEFAULT_SKILLS_DIR: &str = "/skills";
 
 /// Entrypoint for `xiaohe supervisor`.
-pub async fn run() {
+pub async fn run() -> std::io::Result<()> {
     let socket =
         std_env::var("RUNTIME_SOCKET").unwrap_or_else(|_| DEFAULT_RUNTIME_SOCKET.to_owned());
     let skills_dir = std_env::var("SKILLS_DIR").unwrap_or_else(|_| DEFAULT_SKILLS_DIR.to_owned());
 
-    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
     let mut manager = SupervisorManager::new(&skills_dir, events_tx);
     let errors = manager.scan();
     if !errors.is_empty() {
@@ -41,6 +44,44 @@ pub async fn run() {
         discovered_skills = manager.list_summaries().len(),
         "xiaohe supervisor initialized"
     );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let manager = Arc::new(AsyncMutex::new(manager));
+    run_uds_server(&socket, manager, events_rx, shutdown_rx).await
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "failed to install Ctrl+C signal handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to install SIGTERM signal handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => info!("supervisor received SIGINT, initiating graceful shutdown"),
+        () = terminate => info!("supervisor received SIGTERM, initiating graceful shutdown"),
+    }
 }
 
 #[cfg(test)]
