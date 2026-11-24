@@ -115,6 +115,15 @@ pub async fn run() -> Result<(), CoreError> {
         source,
     })?;
 
+    let web_dist_dir = std::env::var("WEB_DIST_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let local = std::path::PathBuf::from("web/dist");
+            local.join("index.html").is_file().then_some(local)
+        });
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
         protocol_version = PROTOCOL_VERSION,
@@ -126,23 +135,27 @@ pub async fn run() -> Result<(), CoreError> {
         automations = automation_engine.list_rules().len(),
         auth_initialized = auth.is_initialized(),
         runtime_socket = %system.runtime.socket_path,
+        web_dist_dir = ?web_dist_dir,
         "xiaohe core listening"
     );
 
-    let router = http::build_router(AppState {
-        config_store,
-        areas: Arc::new(std::sync::RwLock::new(areas)),
-        devices: Arc::new(std::sync::RwLock::new(devices)),
-        secrets: Arc::new(std::sync::RwLock::new(secrets)),
-        history,
-        state,
-        events,
-        webhooks: Arc::new(system.webhooks),
-        skills: Some(skill_bridge.clone()),
-        automations: Some(automation_engine.clone()),
-        executor: action_executor,
-        auth,
-    });
+    let router = http::build_router_with_spa(
+        AppState {
+            config_store,
+            areas: Arc::new(std::sync::RwLock::new(areas)),
+            devices: Arc::new(std::sync::RwLock::new(devices)),
+            secrets: Arc::new(std::sync::RwLock::new(secrets)),
+            history,
+            state,
+            events,
+            webhooks: Arc::new(system.webhooks),
+            skills: Some(skill_bridge.clone()),
+            automations: Some(automation_engine.clone()),
+            executor: action_executor,
+            auth,
+        },
+        web_dist_dir,
+    );
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;

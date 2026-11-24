@@ -8,13 +8,15 @@ pub mod skills;
 pub mod users;
 pub mod webhooks;
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
@@ -56,11 +58,18 @@ struct ReadinessResponse {
 
 /// Build the `axum` HTTP router with health probes, auth/RBAC, full REST API, SSE, and OpenAPI docs.
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_spa(state, None)
+}
+
+/// Build the `axum` HTTP router with optional static SolidJS SPA serving (`web_dist_dir`).
+///
+/// Unknown `/api/*` paths always return JSON `404 {"error":"not_found"}` rather than `index.html`.
+pub fn build_router_with_spa(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
     let webhook_route = Router::new()
         .route("/api/webhooks/{webhook_id}", post(handle_webhook))
         .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES));
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/health/ready", get(health_ready))
         .route("/docs", get(openapi::docs_html))
@@ -153,8 +162,23 @@ pub fn build_router(state: AppState) -> Router {
         // Live Events (SSE, RBAC-filtered)
         .route("/api/events", get(events::sse_events))
         .merge(webhook_route)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        // Ensure unknown /api/* routes return JSON 404 rather than SPA index.html
+        .route("/api", any(api_not_found))
+        .route("/api/{*rest}", any(api_not_found));
+
+    if let Some(dist_dir) = web_dist_dir {
+        let index_html = dist_dir.join("index.html");
+        if index_html.is_file() {
+            let spa_service = ServeDir::new(&dist_dir).fallback(ServeFile::new(index_html));
+            router = router.fallback_service(spa_service);
+        }
+    }
+
+    router.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+async fn api_not_found() -> axum::response::Response {
+    auth::api_error(StatusCode::NOT_FOUND, "not_found", None)
 }
 
 async fn health() -> Json<LivenessResponse> {
@@ -1733,5 +1757,90 @@ action = "turn_on"
                 Some("192.168.1.42")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn spa_static_serving_and_api_404_isolation() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], false).await;
+        let dist_dir = fixture._dir.path().join("web_dist");
+        std::fs::create_dir_all(dist_dir.join("assets")).expect("create dist");
+        std::fs::write(
+            dist_dir.join("index.html"),
+            "<!doctype html><html><body>xiaohe-spa</body></html>",
+        )
+        .expect("write index.html");
+        std::fs::write(dist_dir.join("assets/app.js"), "console.log('ok');").expect("write asset");
+
+        let app = build_router_with_spa(fixture.state, Some(dist_dir));
+
+        // 1. Root serves index.html
+        let root = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = String::from_utf8(
+            root.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(root_body.contains("xiaohe-spa"));
+
+        // 2. Client-side SPA route falls back to index.html
+        let spa_route = app
+            .clone()
+            .oneshot(Request::get("/automations").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(spa_route.status(), StatusCode::OK);
+        let spa_body = String::from_utf8(
+            spa_route
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(spa_body.contains("xiaohe-spa"));
+
+        // 3. Static asset serves real JS file
+        let asset = app
+            .clone()
+            .oneshot(Request::get("/assets/app.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = String::from_utf8(
+            asset
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(asset_body, "console.log('ok');");
+
+        // 4. Unknown /api/* returns JSON 404, NOT index.html
+        let api_missing = app
+            .clone()
+            .oneshot(
+                Request::get("/api/does_not_exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(api_missing).await["error"], "not_found");
     }
 }
