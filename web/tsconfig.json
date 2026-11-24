@@ -9,11 +9,13 @@
     "jsxImportSource": "solid-js",
     "types": ["vite/client"],
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
 }

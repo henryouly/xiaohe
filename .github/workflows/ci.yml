@@ -69,6 +69,11 @@ jobs:
         working-directory: web
         run: npx tsc --noEmit
 
+      - name: Run web unit tests
+        if: steps.check_web.outputs.exists == 'true'
+        working-directory: web
+        run: npm test
+
       - name: Build bundle
         if: steps.check_web.outputs.exists == 'true'
         working-directory: web
