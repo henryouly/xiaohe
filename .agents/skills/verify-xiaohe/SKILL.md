@@ -1,11 +1,11 @@
 ---
 name: verify-xiaohe
-description: "Project-local verification skill that launches, health-checks, drives, captures evidence from, and cleans up Xiaohe (CLI, TOML config, SQLite WAL persistence, health/webhook endpoints, supervisor + Python Skills over UDS, declarative TOML automations, multi-user Auth/RBAC, full REST API, RBAC-filtered SSE, and OpenAPI 3.1 docs). Use whenever proving a feature or verifying a change against the real xiaohe binary."
+description: "Project-local verification skill that launches, health-checks, drives, captures evidence from, and cleans up Xiaohe (CLI, TOML config, SQLite WAL persistence, health/webhook endpoints, supervisor + Python Skills over UDS, declarative TOML automations, multi-user Auth/RBAC, full REST API, RBAC-filtered SSE, OpenAPI 3.1 docs, and SolidJS SPA static serving). Use whenever proving a feature or verifying a change against the real xiaohe binary."
 ---
 
 # Verify Xiaohe
 
-This skill drives the real `xiaohe` Rust binary (`xiaohe supervisor` + `xiaohe core`) against disposable config and SQLite directories to prove user-facing behavior across Phases 1–5. Read [features/README.md](features/README.md) first, then follow the matching feature recipe.
+This skill drives the real `xiaohe` Rust binary (`xiaohe supervisor` + `xiaohe core`) against disposable config and SQLite directories to prove user-facing behavior across Phases 1–6. Read [features/README.md](features/README.md) first, then follow the matching feature recipe.
 
 ## Launch
 
