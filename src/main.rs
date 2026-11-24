@@ -32,10 +32,13 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Commands::Supervisor => {
-            xiaohe::supervisor::run().await;
-            ExitCode::SUCCESS
-        }
+        Commands::Supervisor => match xiaohe::supervisor::run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                error!(error = %err, "xiaohe supervisor failed to start");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

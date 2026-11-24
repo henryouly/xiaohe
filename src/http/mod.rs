@@ -12,6 +12,7 @@ use tracing::warn;
 
 use crate::config::WebhookConfig;
 use crate::http::webhooks::{MAX_WEBHOOK_BODY_BYTES, handle_webhook};
+use crate::skills::SkillBridge;
 use crate::state::{EventBus, StateStore};
 use crate::storage::HistoryStore;
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub state: StateStore,
     pub events: EventBus,
     pub webhooks: Arc<Vec<WebhookConfig>>,
+    pub skills: Option<SkillBridge>,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,13 +56,19 @@ async fn health() -> Json<LivenessResponse> {
 }
 
 async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
+    let runtime = match &state.skills {
+        Some(bridge) if bridge.is_connected() => "ok",
+        Some(_) => "disconnected",
+        None => "disabled",
+    };
+
     match state.history.health_check().await {
         Ok(()) => (
             StatusCode::OK,
             Json(ReadinessResponse {
                 status: "ok",
                 storage: "ok",
-                runtime: "disabled",
+                runtime,
             }),
         ),
         Err(err) => {
@@ -70,7 +78,7 @@ async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Readin
                 Json(ReadinessResponse {
                     status: "degraded",
                     storage: "error",
-                    runtime: "disabled",
+                    runtime,
                 }),
             )
         }
@@ -159,6 +167,7 @@ mod tests {
             state,
             events,
             webhooks: Arc::new(vec![]),
+            skills: None,
         });
 
         let resp = app
@@ -188,6 +197,7 @@ mod tests {
             state,
             events,
             webhooks: Arc::new(vec![]),
+            skills: None,
         });
 
         let ready = app
@@ -239,6 +249,7 @@ mod tests {
             state,
             events,
             webhooks,
+            skills: None,
         });
 
         // 1. Bearer auth + JSON body -> 202 + WebhookReceived with auth headers stripped

@@ -3,6 +3,7 @@ pub mod core;
 pub mod esphome;
 pub mod http;
 pub mod protocol;
+pub mod skills;
 pub mod state;
 pub mod storage;
 pub mod supervisor;
