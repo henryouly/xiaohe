@@ -83,3 +83,38 @@ test("applyEntityStateEvent updates cached entity and returns null for unknown e
   });
   assert.equal(missing, null);
 });
+
+test("regression: applyEntityStateEvent clears area_id when SSE sends null and preserves when undefined", () => {
+  const existing = makeLight("light.living", true, 1000, "living_room");
+
+  const cleared = applyEntityStateEvent(existing, {
+    entity_id: "light.living",
+    area_id: null,
+    availability: "online",
+    state: { domain: "light", on: false },
+    extra: {},
+    last_changed_at: 2000,
+    last_updated_at: 2000,
+  });
+  assert.ok(cleared);
+  assert.equal(cleared.area_id, undefined);
+
+  const preserved = applyEntityStateEvent(existing, {
+    entity_id: "light.living",
+    last_changed_at: 2100,
+    last_updated_at: 2100,
+  });
+  assert.ok(preserved);
+  assert.equal(preserved.area_id, "living_room");
+});
+
+test("regression: mergeEntitiesSnapshot preserves newer local area_id over stale REST snapshot", () => {
+  const local = {
+    "light.living": makeLight("light.living", true, 2000, "kitchen"),
+  };
+  const stale = [makeLight("light.living", false, 1500, "living_room")];
+
+  const merged = mergeEntitiesSnapshot(local, stale);
+  assert.equal(merged["light.living"].area_id, "kitchen");
+  assert.equal(merged["light.living"].last_updated_at, 2000);
+});

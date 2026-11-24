@@ -199,7 +199,7 @@ export const XiaoheProvider: ParentComponent = (props) => {
           const payload = JSON.parse((ev as MessageEvent).data) as SseEntityStatePayload;
           const updated = applyEntityStateEvent(entities[payload.entity_id], payload);
           if (updated) {
-            setEntities(payload.entity_id, updated);
+            setEntities(payload.entity_id, reconcile(updated));
           } else {
             // New entity discovered after initial snapshot — resync metadata.
             void refreshSnapshot();
