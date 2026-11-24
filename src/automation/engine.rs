@@ -198,6 +198,7 @@ struct EngineInner {
     history: Arc<dyn HistoryStore>,
     executor: Arc<dyn ActionExecutor>,
     rules: StdMutex<Vec<AutomationConfig>>,
+    rule_files: StdMutex<HashMap<String, PathBuf>>,
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<AutomationSlot>>>>,
     next_debounce_gen: AtomicU64,
     debouncers: StdMutex<HashMap<DebounceKey, (u64, watch::Sender<bool>)>>,
@@ -255,6 +256,7 @@ impl AutomationEngine {
             history,
             executor,
             rules: StdMutex::new(Vec::new()),
+            rule_files: StdMutex::new(HashMap::new()),
             slots: StdMutex::new(HashMap::new()),
             next_debounce_gen: AtomicU64::new(1),
             debouncers: StdMutex::new(HashMap::new()),
@@ -288,6 +290,19 @@ impl AutomationEngine {
         (engine, errors)
     }
 
+    pub fn automations_dir(&self) -> &std::path::Path {
+        &self.inner.automations_dir
+    }
+
+    pub fn get_rule_file(&self, automation_id: &str) -> Option<PathBuf> {
+        self.inner
+            .rule_files
+            .lock()
+            .expect("rule_files mutex poisoned")
+            .get(automation_id)
+            .cloned()
+    }
+
     /// Reload all `*.toml` rules from disk, cancelling obsolete debounce timers.
     pub fn reload(&self) -> (Vec<LoadedAutomation>, Vec<AutomationError>) {
         let mut ctx = ValidationContext::default();
@@ -317,7 +332,12 @@ impl AutomationEngine {
             }
         }
 
-        let configs: Vec<AutomationConfig> = loaded.iter().map(|l| l.config.clone()).collect();
+        let mut files = HashMap::with_capacity(loaded.len());
+        let mut configs = Vec::with_capacity(loaded.len());
+        for item in &loaded {
+            files.insert(item.config.id.clone(), item.path.clone());
+            configs.push(item.config.clone());
+        }
         info!(
             count = configs.len(),
             errors = errors.len(),
@@ -325,6 +345,11 @@ impl AutomationEngine {
             "loaded declarative automations"
         );
         *self.inner.rules.lock().expect("rules mutex poisoned") = configs;
+        *self
+            .inner
+            .rule_files
+            .lock()
+            .expect("rule_files mutex poisoned") = files;
         (loaded, errors)
     }
 
@@ -351,6 +376,45 @@ impl AutomationEngine {
             .ok_or_else(|| format!("automation '{automation_id}' not found"))?;
         dispatch_trigger(Arc::clone(&self.inner), rule, "manual".to_owned()).await;
         Ok(())
+    }
+
+    /// Manually trigger a loaded automation and return its `run_id`, optionally bypassing
+    /// `[[conditions]]`.
+    pub async fn trigger_manual_with_options(
+        &self,
+        automation_id: &str,
+        skip_conditions: bool,
+    ) -> Result<String, String> {
+        let mut rule = self
+            .inner
+            .rules
+            .lock()
+            .expect("rules mutex poisoned")
+            .iter()
+            .find(|r| r.id == automation_id)
+            .cloned()
+            .ok_or_else(|| format!("automation '{automation_id}' not found"))?;
+        if skip_conditions {
+            rule.conditions.clear();
+        }
+        let run_id = new_run_id();
+        let slot = get_or_create_slot(&self.inner, &rule.id);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        {
+            let mut guard = slot.lock().await;
+            guard.active.push(ActiveRun {
+                run_id: run_id.clone(),
+                cancel_tx,
+            });
+        }
+        let flight = InFlightGuard::acquire(&self.inner);
+        let inner = Arc::clone(&self.inner);
+        let rid = run_id.clone();
+        tokio::spawn(async move {
+            let _flight = flight;
+            execute_run(inner, slot, rule, rid, "manual".to_owned(), cancel_rx).await;
+        });
+        Ok(run_id)
     }
 
     /// Gracefully wait for background automation loops and all in-flight runs to exit and persist

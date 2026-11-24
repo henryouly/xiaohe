@@ -1,8 +1,14 @@
+pub mod areas;
 pub mod auth;
+pub mod automations;
+pub mod entities;
+pub mod events;
+pub mod openapi;
+pub mod skills;
 pub mod users;
 pub mod webhooks;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
@@ -13,7 +19,8 @@ use tower_http::trace::TraceLayer;
 use tracing::warn;
 
 use crate::auth::AuthService;
-use crate::config::WebhookConfig;
+use crate::automation::{ActionExecutor, AutomationEngine};
+use crate::config::{AreasConfig, ConfigStore, DevicesConfig, SecretsConfig, WebhookConfig};
 use crate::http::webhooks::{MAX_WEBHOOK_BODY_BYTES, handle_webhook};
 use crate::skills::SkillBridge;
 use crate::state::{EventBus, StateStore};
@@ -21,11 +28,17 @@ use crate::storage::HistoryStore;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub config_store: ConfigStore,
+    pub areas: Arc<RwLock<AreasConfig>>,
+    pub devices: Arc<RwLock<DevicesConfig>>,
+    pub secrets: Arc<RwLock<SecretsConfig>>,
     pub history: Arc<dyn HistoryStore>,
     pub state: StateStore,
     pub events: EventBus,
     pub webhooks: Arc<Vec<WebhookConfig>>,
     pub skills: Option<SkillBridge>,
+    pub automations: Option<AutomationEngine>,
+    pub executor: Arc<dyn ActionExecutor>,
     pub auth: AuthService,
 }
 
@@ -41,7 +54,7 @@ struct ReadinessResponse {
     runtime: &'static str,
 }
 
-/// Build the `axum` HTTP router with health probes, auth/RBAC, user management, and webhooks.
+/// Build the `axum` HTTP router with health probes, auth/RBAC, full REST API, SSE, and OpenAPI docs.
 pub fn build_router(state: AppState) -> Router {
     let webhook_route = Router::new()
         .route("/api/webhooks/{webhook_id}", post(handle_webhook))
@@ -50,10 +63,80 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/health/ready", get(health_ready))
+        .route("/docs", get(openapi::docs_html))
+        .route("/api/openapi.json", get(openapi::openapi_json))
+        // Auth
         .route("/api/auth/bootstrap", post(auth::bootstrap))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        // Areas
+        .route(
+            "/api/areas",
+            get(areas::list_areas).post(areas::create_area),
+        )
+        .route(
+            "/api/areas/{area_id}",
+            put(areas::update_area).delete(areas::delete_area),
+        )
+        // Entities & History
+        .route("/api/entities", get(entities::list_entities))
+        .route("/api/entities/{entity_id}", get(entities::get_entity))
+        .route(
+            "/api/entities/{entity_id}/command",
+            post(entities::command_entity),
+        )
+        .route(
+            "/api/entities/{entity_id}/history",
+            get(entities::entity_history),
+        )
+        // Skills (Admin)
+        .route("/api/skills", get(skills::list_skills))
+        .route("/api/skills/{skill_id}", get(skills::get_skill))
+        .route(
+            "/api/skills/{skill_id}/config",
+            put(skills::update_skill_config),
+        )
+        .route("/api/skills/{skill_id}/start", post(skills::start_skill))
+        .route("/api/skills/{skill_id}/stop", post(skills::stop_skill))
+        .route(
+            "/api/skills/{skill_id}/restart",
+            post(skills::restart_skill),
+        )
+        .route(
+            "/api/skills/{skill_id}/reinstall",
+            post(skills::reinstall_skill),
+        )
+        .route("/api/skills/{skill_id}/logs", get(skills::get_skill_logs))
+        .route("/api/skills/{skill_id}/invoke", post(skills::invoke_skill))
+        // Automations (Admin)
+        .route(
+            "/api/automations",
+            get(automations::list_automations).post(automations::create_automation),
+        )
+        .route(
+            "/api/automations/runs",
+            get(automations::list_automation_runs),
+        )
+        .route(
+            "/api/automations/reload",
+            post(automations::reload_automations),
+        )
+        .route(
+            "/api/automations/{id}",
+            get(automations::get_automation)
+                .put(automations::update_automation)
+                .delete(automations::delete_automation),
+        )
+        .route(
+            "/api/automations/{id}/toggle",
+            post(automations::toggle_automation),
+        )
+        .route(
+            "/api/automations/{id}/trigger",
+            post(automations::trigger_automation),
+        )
+        // Users & API Tokens (Admin)
         .route(
             "/api/users",
             get(users::list_users).post(users::create_user),
@@ -67,6 +150,8 @@ pub fn build_router(state: AppState) -> Router {
             "/api/users/{user_id}/tokens/{token_id}",
             delete(users::revoke_token),
         )
+        // Live Events (SSE, RBAC-filtered)
+        .route("/api/events", get(events::sse_events))
         .merge(webhook_route)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -168,6 +253,87 @@ mod tests {
         }
     }
 
+    use std::sync::Mutex as StdMutex;
+    use tokio::time::{Duration, timeout};
+
+    use crate::automation::AutomationEngine;
+    use crate::config::LocationConfig;
+    use crate::protocol::domain::{
+        Availability, DomainState, EntityRecord, EntitySource, LockState,
+    };
+    use crate::protocol::skill::SkillStatus;
+    use crate::storage::{AutomationOutcome, HistoryEntryKind};
+
+    type RecordedCommand = (String, String, serde_json::Map<String, Value>);
+
+    struct TestExecutor {
+        commands: StdMutex<Vec<RecordedCommand>>,
+    }
+
+    impl TestExecutor {
+        fn new() -> Self {
+            Self {
+                commands: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedCommand> {
+            self.commands.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ActionExecutor for TestExecutor {
+        async fn call_entity(
+            &self,
+            entity_id: &str,
+            action: &str,
+            params: serde_json::Map<String, Value>,
+        ) -> Result<Value, String> {
+            self.commands.lock().expect("lock").push((
+                entity_id.to_owned(),
+                action.to_owned(),
+                params,
+            ));
+            Ok(json!({ "ok": true }))
+        }
+
+        async fn invoke_skill(
+            &self,
+            _skill_id: &str,
+            _action: &str,
+            _params: serde_json::Map<String, Value>,
+            _context: serde_json::Map<String, Value>,
+            _timeout: Duration,
+        ) -> Result<Value, String> {
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    fn make_entity(
+        entity_id: &str,
+        name: &str,
+        area_id: Option<&str>,
+        state: DomainState,
+    ) -> EntityRecord {
+        EntityRecord {
+            entity_id: entity_id.to_owned(),
+            device_id: None,
+            area_id: area_id.map(str::to_owned),
+            name: name.to_owned(),
+            source: EntitySource::EspHome {
+                node_id: "node1".into(),
+            },
+            availability: Availability::Online,
+            state,
+            capabilities: vec![],
+            extra: serde_json::Map::new(),
+            custom_actions: vec![],
+            last_changed_at: 0,
+            last_updated_at: 0,
+        }
+    }
+
     async fn json_body(response: axum::response::Response) -> Value {
         let bytes = response
             .into_body()
@@ -178,29 +344,143 @@ mod tests {
         serde_json::from_slice(&bytes).expect("parse json")
     }
 
-    fn test_auth() -> (tempfile::TempDir, AuthService) {
+    struct TestFixture {
+        _dir: tempfile::TempDir,
+        _shutdown_tx: tokio::sync::watch::Sender<bool>,
+        state: AppState,
+        executor: Arc<TestExecutor>,
+    }
+
+    async fn test_fixture(
+        history: Arc<dyn HistoryStore>,
+        webhooks: Vec<WebhookConfig>,
+        with_automations: bool,
+    ) -> TestFixture {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let auth = AuthService::new(
-            crate::config::ConfigStore::new(dir.path()),
-            crate::config::UsersConfig::default(),
-        );
-        (dir, auth)
+        let config_store = ConfigStore::new(dir.path());
+        let events = EventBus::new();
+        let state_store = StateStore::new(events.clone());
+        let executor = Arc::new(TestExecutor::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let automations = if with_automations {
+            let auto_dir = dir.path().join("automations");
+            std::fs::create_dir_all(&auto_dir).expect("create automations dir");
+            let (engine, _errors) = AutomationEngine::start(
+                auto_dir,
+                LocationConfig {
+                    latitude: Some(39.9),
+                    longitude: Some(116.4),
+                    ..LocationConfig::default()
+                },
+                state_store.clone(),
+                events.clone(),
+                history.clone(),
+                executor.clone(),
+                shutdown_rx,
+            );
+            Some(engine)
+        } else {
+            None
+        };
+        let auth = AuthService::new(config_store.clone(), crate::config::UsersConfig::default());
+        let app_state = AppState {
+            config_store,
+            areas: Arc::new(RwLock::new(AreasConfig::default())),
+            devices: Arc::new(RwLock::new(DevicesConfig::default())),
+            secrets: Arc::new(RwLock::new(SecretsConfig::default())),
+            history,
+            state: state_store,
+            events,
+            webhooks: Arc::new(webhooks),
+            skills: None,
+            automations,
+            executor: executor.clone(),
+            auth,
+        };
+        TestFixture {
+            _dir: dir,
+            _shutdown_tx: shutdown_tx,
+            state: app_state,
+            executor,
+        }
+    }
+
+    async fn bootstrap_admin_cookie(app: &Router) -> String {
+        let boot = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123","display_name":"Admin"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boot.status(), StatusCode::CREATED);
+        boot.headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("Set-Cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn create_user_and_token(
+        app: &Router,
+        admin_cookie: &str,
+        username: &str,
+        role: &str,
+        allowed_areas: &[&str],
+    ) -> String {
+        let payload = json!({
+            "username": username,
+            "display_name": username,
+            "password": "password123",
+            "role": role,
+            "allowed_areas": allowed_areas,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/users")
+                    .header("cookie", admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let user_id = json_body(resp).await["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mint = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/users/{user_id}/tokens"))
+                    .header("cookie", admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mint.status(), StatusCode::CREATED);
+        json_body(mint).await["token"].as_str().unwrap().to_owned()
     }
 
     #[tokio::test]
     async fn health_and_ready_return_200_with_healthy_store() {
         let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
-        let events = EventBus::new();
-        let state = StateStore::new(events.clone());
-        let (_dir, auth) = test_auth();
-        let app = build_router(AppState {
-            history: store,
-            state,
-            events,
-            webhooks: Arc::new(vec![]),
-            skills: None,
-            auth,
-        });
+        let fixture = test_fixture(store, vec![], false).await;
+        let app = build_router(fixture.state);
 
         let resp = app
             .clone()
@@ -222,17 +502,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_ready_returns_503_when_storage_fails() {
-        let events = EventBus::new();
-        let state = StateStore::new(events.clone());
-        let (_dir, auth) = test_auth();
-        let app = build_router(AppState {
-            history: Arc::new(FailingStore),
-            state,
-            events,
-            webhooks: Arc::new(vec![]),
-            skills: None,
-            auth,
-        });
+        let fixture = test_fixture(Arc::new(FailingStore), vec![], false).await;
+        let app = build_router(fixture.state);
 
         let ready = app
             .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
@@ -247,17 +518,13 @@ mod tests {
     #[tokio::test]
     async fn webhook_accepts_bearer_and_header_secret_and_publishes_sanitized_event() {
         let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
-        let events = EventBus::new();
-        let mut rx = events.subscribe();
-        let state = StateStore::new(events.clone());
-
         let secret = "my-super-secret-webhook-token";
         // Independently computed via `printf '%s' 'my-super-secret-webhook-token' | sha256sum`.
         let expected_hex = "bddbaa946a00f5f1c2add380d6eac35745b05f011dfd408f619d43c48ec1a97b";
         let expected_hash = format!("sha256:{expected_hex}");
         assert_eq!(hash_webhook_secret(secret), expected_hash);
 
-        let webhooks = Arc::new(vec![
+        let webhooks = vec![
             WebhookConfig {
                 id: "ios_arriving".into(),
                 name: Some("iOS Shortcuts".into()),
@@ -276,17 +543,11 @@ mod tests {
                 secret_hash: format!("sha256:{expected_hex}"),
                 enabled: false,
             },
-        ]);
+        ];
 
-        let (_dir, auth) = test_auth();
-        let app = build_router(AppState {
-            history: store,
-            state,
-            events,
-            webhooks,
-            skills: None,
-            auth,
-        });
+        let fixture = test_fixture(store, webhooks, false).await;
+        let mut rx = fixture.state.events.subscribe();
+        let app = build_router(fixture.state);
 
         // 1. Bearer auth + JSON body -> 202 + WebhookReceived with auth headers stripped
         let req = Request::post("/api/webhooks/ios_arriving")
@@ -407,17 +668,8 @@ mod tests {
     #[tokio::test]
     async fn auth_bootstrap_login_tokens_and_rbac_enforcement() {
         let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
-        let events = EventBus::new();
-        let state = StateStore::new(events.clone());
-        let (_dir, auth) = test_auth();
-        let app = build_router(AppState {
-            history: store,
-            state,
-            events,
-            webhooks: Arc::new(vec![]),
-            skills: None,
-            auth,
-        });
+        let fixture = test_fixture(store, vec![], false).await;
+        let app = build_router(fixture.state);
 
         // 1. Before bootstrap: /api/auth/me reports initialized=false, user=null
         let me0 = app
@@ -604,5 +856,452 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_logout.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn areas_entities_commands_and_history_enforce_rbac() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        store
+            .record_state_batch(&[StateHistoryEntry {
+                entity_id: "light.living".into(),
+                ts: 1_700_000_000_000,
+                kind: HistoryEntryKind::Discrete {
+                    state: "on".into(),
+                    attributes: Some(json!({"on": true})),
+                },
+            }])
+            .await
+            .expect("seed history");
+
+        let fixture = test_fixture(store, vec![], false).await;
+        // Register 3 entities across living_room and bedroom
+        fixture.state.state.upsert_entity(make_entity(
+            "light.living",
+            "Living Light",
+            Some("living_room"),
+            DomainState::Light {
+                on: true,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+        ));
+        fixture.state.state.upsert_entity(make_entity(
+            "lock.living",
+            "Front Door",
+            Some("living_room"),
+            DomainState::Lock {
+                state: LockState::Locked,
+            },
+        ));
+        fixture.state.state.upsert_entity(make_entity(
+            "light.bedroom",
+            "Bedroom Light",
+            Some("bedroom"),
+            DomainState::Light {
+                on: false,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+        ));
+
+        let executor = fixture.executor.clone();
+        let app = build_router(fixture.state);
+        let admin_cookie = bootstrap_admin_cookie(&app).await;
+        let guest_token =
+            create_user_and_token(&app, &admin_cookie, "guest1", "guest", &["living_room"]).await;
+
+        // Admin creates two areas
+        for (area_id, name) in [("living_room", "Living Room"), ("bedroom", "Bedroom")] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/areas")
+                        .header("cookie", &admin_cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"area_id": area_id, "name": name}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        // Guest sees only living_room in /api/areas (with entity_count = 2)
+        let guest_areas = app
+            .clone()
+            .oneshot(
+                Request::get("/api/areas")
+                    .header("authorization", format!("Bearer {guest_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guest_areas.status(), StatusCode::OK);
+        let areas_json = json_body(guest_areas).await;
+        assert_eq!(areas_json["areas"].as_array().unwrap().len(), 1);
+        assert_eq!(areas_json["areas"][0]["area_id"], "living_room");
+        assert_eq!(areas_json["areas"][0]["entity_count"], 2);
+
+        // Guest cannot create areas -> 403
+        let guest_create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/areas")
+                    .header("authorization", format!("Bearer {guest_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"area_id":"kitchen","name":"Kitchen"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guest_create.status(), StatusCode::FORBIDDEN);
+
+        // Guest sees only living_room entities in /api/entities
+        let guest_ents = app
+            .clone()
+            .oneshot(
+                Request::get("/api/entities")
+                    .header("authorization", format!("Bearer {guest_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guest_ents.status(), StatusCode::OK);
+        let ents_json = json_body(guest_ents).await;
+        assert_eq!(ents_json["entities"].as_array().unwrap().len(), 2);
+
+        // Guest GET /api/entities/light.bedroom -> 403
+        let bedroom_get = app
+            .clone()
+            .oneshot(
+                Request::get("/api/entities/light.bedroom")
+                    .header("authorization", format!("Bearer {guest_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bedroom_get.status(), StatusCode::FORBIDDEN);
+
+        // Guest POST command on lock.living -> 403 (guests cannot control locks)
+        let guest_lock = app
+            .clone()
+            .oneshot(
+                Request::post("/api/entities/lock.living/command")
+                    .header("authorization", format!("Bearer {guest_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"unlock"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guest_lock.status(), StatusCode::FORBIDDEN);
+
+        // Guest POST command on light.living -> 200 and recorded by executor
+        let guest_light = app
+            .clone()
+            .oneshot(
+                Request::post("/api/entities/light.living/command")
+                    .header("authorization", format!("Bearer {guest_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"action":"turn_off","params":{"transition":1}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guest_light.status(), StatusCode::OK);
+        assert_eq!(executor.recorded().len(), 1);
+        assert_eq!(executor.recorded()[0].0, "light.living");
+        assert_eq!(executor.recorded()[0].1, "turn_off");
+
+        // Guest GET history for light.living -> 200 with 1 transition
+        let hist = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/entities/light.living/history?from=1699999000000&to=1700001000000",
+                )
+                .header("authorization", format!("Bearer {guest_token}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hist.status(), StatusCode::OK);
+        let hist_json = json_body(hist).await;
+        assert_eq!(hist_json["entity_id"], "light.living");
+        assert_eq!(hist_json["transitions"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn automations_crud_validation_toggle_trigger_and_runs() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], true).await;
+        let executor = fixture.executor.clone();
+        let app = build_router(fixture.state);
+        let admin_cookie = bootstrap_admin_cookie(&app).await;
+
+        let valid_toml = r#"
+id = "auto_test"
+name = "Test Rule"
+enabled = true
+
+[[triggers]]
+type = "webhook"
+webhook_id = "hook1"
+
+[[actions]]
+type = "entity.call"
+entity_id = "light.living"
+action = "turn_on"
+"#;
+
+        // 1. Invalid TOML -> 422
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::post("/api/automations")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"raw_toml": "id = \"bad\"\n"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // 2. Create valid automation -> 201
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/automations")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"raw_toml": valid_toml}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(json_body(created).await["id"], "auto_test");
+
+        // 3. Trigger manually -> 200 and executes action asynchronously
+        let trig = app
+            .clone()
+            .oneshot(
+                Request::post("/api/automations/auto_test/trigger")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"skip_conditions":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trig.status(), StatusCode::OK);
+        for _ in 0..50 {
+            if executor.recorded().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(executor.recorded().len(), 1);
+
+        // 4. Query runs -> includes our manual run
+        let mut run_count = 0;
+        for _ in 0..50 {
+            let runs = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/automations/runs?automation_id=auto_test")
+                        .header("cookie", &admin_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(runs.status(), StatusCode::OK);
+            run_count = json_body(runs).await["runs"].as_array().unwrap().len();
+            if run_count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(run_count, 1);
+
+        // 5. Toggle disabled -> 200
+        let toggle = app
+            .clone()
+            .oneshot(
+                Request::post("/api/automations/auto_test/toggle")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(toggle.status(), StatusCode::OK);
+        assert_eq!(json_body(toggle).await["enabled"], false);
+
+        // 6. Delete -> 204
+        let del = app
+            .clone()
+            .oneshot(
+                Request::delete("/api/automations/auto_test")
+                    .header("cookie", &admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn sse_events_filters_by_rbac_and_openapi_serves_spec_and_docs() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], false).await;
+        let events = fixture.state.events.clone();
+        fixture.state.state.upsert_entity(make_entity(
+            "light.living",
+            "Living Light",
+            Some("living_room"),
+            DomainState::Light {
+                on: false,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+        ));
+        fixture.state.state.upsert_entity(make_entity(
+            "light.bedroom",
+            "Bedroom Light",
+            Some("bedroom"),
+            DomainState::Light {
+                on: false,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+        ));
+
+        let app = build_router(fixture.state);
+        let admin_cookie = bootstrap_admin_cookie(&app).await;
+        let member_token =
+            create_user_and_token(&app, &admin_cookie, "alice", "member", &["living_room"]).await;
+
+        // 1. OpenAPI 3.1 JSON + /docs HTML
+        let spec_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spec_resp.status(), StatusCode::OK);
+        let spec = json_body(spec_resp).await;
+        assert!(spec["openapi"].as_str().unwrap().starts_with("3.1"));
+        assert!(spec["paths"]["/api/entities"].is_object());
+        assert!(spec["paths"]["/api/events"].is_object());
+
+        let docs_resp = app
+            .clone()
+            .oneshot(Request::get("/docs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(docs_resp.status(), StatusCode::OK);
+
+        // 2. Unauthenticated SSE -> 401
+        let unauth_sse = app
+            .clone()
+            .oneshot(Request::get("/api/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth_sse.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Member SSE receives ONLY living_room entity_state, NOT bedroom, NOT skill_status, NOT automation_run
+        let member_sse = app
+            .clone()
+            .oneshot(
+                Request::get("/api/events")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(member_sse.status(), StatusCode::OK);
+        let mut body = member_sse.into_body();
+
+        // Publish forbidden events first, then an allowed living_room event
+        events.publish(CoreEvent::EntityStateChanged {
+            entity_id: "light.bedroom".into(),
+            area_id: Some("bedroom".into()),
+            old_state: None,
+            new_state: DomainState::Light {
+                on: true,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+            extra: serde_json::Map::new(),
+            at: 1,
+        });
+        events.publish(CoreEvent::SkillStatusChanged {
+            skill_id: "miio".into(),
+            status: SkillStatus::Running,
+            message: None,
+            at: 2,
+        });
+        events.publish(CoreEvent::AutomationRunRecorded {
+            automation_id: "a1".into(),
+            run_id: "r1".into(),
+            outcome: AutomationOutcome::Succeeded,
+            at: 3,
+        });
+        events.publish(CoreEvent::EntityStateChanged {
+            entity_id: "light.living".into(),
+            area_id: Some("living_room".into()),
+            old_state: None,
+            new_state: DomainState::Light {
+                on: true,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+            extra: serde_json::Map::new(),
+            at: 4,
+        });
+
+        let frame = timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("sse frame within timeout")
+            .expect("some frame")
+            .expect("ok frame");
+        let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(
+            chunk.contains("event: entity_state"),
+            "expected entity_state event, got: {chunk}"
+        );
+        assert!(
+            chunk.contains("light.living"),
+            "expected light.living, got: {chunk}"
+        );
+        assert!(
+            !chunk.contains("light.bedroom") && !chunk.contains("miio") && !chunk.contains("a1"),
+            "forbidden event leaked to member SSE: {chunk}"
+        );
     }
 }

@@ -45,8 +45,9 @@ pub async fn run() -> Result<(), CoreError> {
     system.apply_env_overrides();
     let devices = config_store.load_devices()?;
     let secrets = config_store.load_secrets()?;
+    let areas = config_store.load_areas()?;
     let users = config_store.load_users()?;
-    let auth = crate::auth::AuthService::new(config_store, users);
+    let auth = crate::auth::AuthService::new(config_store.clone(), users);
 
     let history = build_history_store(&system.storage).await?;
     let events = EventBus::new();
@@ -65,26 +66,27 @@ pub async fn run() -> Result<(), CoreError> {
 
     let skill_bridge = crate::skills::SkillBridge::start(
         &system.runtime.socket_path,
-        devices.skills,
-        secrets,
+        devices.skills.clone(),
+        secrets.clone(),
         state.clone(),
         events.clone(),
         shutdown_rx.clone(),
     );
 
     let automations_dir = std::path::PathBuf::from(&config_dir).join("automations");
-    let action_executor = Arc::new(crate::automation::CoreActionExecutor::new(
-        state.clone(),
-        Some(skill_bridge.clone()),
-        Some(Arc::clone(&esphome_manager)),
-    ));
+    let action_executor: Arc<dyn crate::automation::ActionExecutor> =
+        Arc::new(crate::automation::CoreActionExecutor::new(
+            state.clone(),
+            Some(skill_bridge.clone()),
+            Some(Arc::clone(&esphome_manager)),
+        ));
     let (automation_engine, auto_errors) = crate::automation::AutomationEngine::start(
         &automations_dir,
         system.location.clone(),
         state.clone(),
         events.clone(),
         Arc::clone(&history),
-        action_executor,
+        Arc::clone(&action_executor),
         shutdown_rx.clone(),
     );
     if !auto_errors.is_empty() {
@@ -128,11 +130,17 @@ pub async fn run() -> Result<(), CoreError> {
     );
 
     let router = http::build_router(AppState {
+        config_store,
+        areas: Arc::new(std::sync::RwLock::new(areas)),
+        devices: Arc::new(std::sync::RwLock::new(devices)),
+        secrets: Arc::new(std::sync::RwLock::new(secrets)),
         history,
         state,
         events,
         webhooks: Arc::new(system.webhooks),
         skills: Some(skill_bridge.clone()),
+        automations: Some(automation_engine.clone()),
+        executor: action_executor,
         auth,
     });
     let serve_result = axum::serve(listener, router)
