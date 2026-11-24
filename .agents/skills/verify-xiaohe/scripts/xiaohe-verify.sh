@@ -19,9 +19,32 @@ repo_root="$(cd "$(dirname "$0")/../../../.." && pwd)"
 scratch_dir="/tmp/xiaohe-verify-${run_id}"
 evidence_dir="/tmp/xiaohe-evidence-${run_id}"
 pid_file="${scratch_dir}/core.pid"
+sup_pid_file="${scratch_dir}/supervisor.pid"
+sock_file="${scratch_dir}/rpc.sock"
 port_file="${scratch_dir}/port"
 log_file="${scratch_dir}/core.log"
+sup_log_file="${scratch_dir}/supervisor.log"
 bin_path="${repo_root}/target/debug/xiaohe"
+
+stop_pid_file() {
+  local pf="$1"
+  if [[ -f "$pf" ]]; then
+    local p
+    p="$(cat "$pf")"
+    if kill -0 "$p" 2>/dev/null; then
+      kill -TERM "$p" 2>/dev/null || true
+      for _ in $(seq 1 30); do
+        if ! kill -0 "$p" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+      if kill -0 "$p" 2>/dev/null; then
+        kill -KILL "$p" 2>/dev/null || true
+      fi
+    fi
+  fi
+}
 
 case "$cmd" in
   launch)
@@ -34,7 +57,6 @@ case "$cmd" in
     mkdir -p "${scratch_dir}/config" "${scratch_dir}/data" "${evidence_dir}"
 
     # Seed verification scaffolding: system.toml with a known webhook secret ("verify-secret").
-    # SHA-256("verify-secret") computed independently:
     secret_hash="sha256:$(printf '%s' 'verify-secret' | sha256sum | awk '{print $1}')"
     cat > "${scratch_dir}/config/system.toml" <<EOF
 [server]
@@ -47,6 +69,9 @@ backend = "sqlite"
 [storage.sqlite]
 path = "${scratch_dir}/data/xiaohe.db"
 retention_days = 30
+
+[runtime]
+socket_path = "${sock_file}"
 
 [[webhooks]]
 id = "verify_hook"
@@ -61,11 +86,51 @@ secret_hash = "${secret_hash}"
 enabled = false
 EOF
 
+    # Enable reference miio-airpurifier device skill in hardware-free demo_mode.
+    cat > "${scratch_dir}/config/devices.toml" <<EOF
+[skills.miio-airpurifier]
+enabled = true
+
+[skills.miio-airpurifier.config]
+demo_mode = true
+poll_interval_secs = 1
+area_id = "living_room"
+EOF
+
     (cd "$repo_root" && cargo build --quiet)
 
+    # 1. Start xiaohe supervisor on isolated UDS socket
+    RUNTIME_SOCKET="${sock_file}" \
+      SKILLS_DIR="${repo_root}/skills" \
+      RUST_LOG="info" \
+      "$bin_path" supervisor >"$sup_log_file" 2>&1 &
+    sup_pid=$!
+    echo "$sup_pid" > "$sup_pid_file"
+
+    sock_ready=0
+    for _ in $(seq 1 40); do
+      if ! kill -0 "$sup_pid" 2>/dev/null; then
+        echo "xiaohe supervisor exited prematurely; log:" >&2
+        cat "$sup_log_file" >&2
+        exit 1
+      fi
+      if [[ -S "$sock_file" ]]; then
+        sock_ready=1
+        break
+      fi
+      sleep 0.1
+    done
+    if [[ "$sock_ready" -ne 1 ]]; then
+      echo "xiaohe supervisor did not create UDS socket ${sock_file}; log:" >&2
+      cat "$sup_log_file" >&2
+      exit 1
+    fi
+
+    # 2. Start xiaohe core connected to supervisor UDS socket
     echo "$port" > "$port_file"
     CONFIG_DIR="${scratch_dir}/config" \
       SQLITE_PATH="${scratch_dir}/data/xiaohe.db" \
+      RUNTIME_SOCKET="${sock_file}" \
       HOST="127.0.0.1" \
       PORT="${port}" \
       RUST_LOG="info" \
@@ -74,13 +139,13 @@ EOF
     echo "$pid" > "$pid_file"
 
     ready=0
-    for _ in $(seq 1 40); do
+    for _ in $(seq 1 50); do
       if ! kill -0 "$pid" 2>/dev/null; then
         echo "xiaohe core exited prematurely; log:" >&2
         cat "$log_file" >&2
         exit 1
       fi
-      if curl -sf "http://127.0.0.1:${port}/health/ready" | grep -q '"storage":"ok"'; then
+      if curl -sf "http://127.0.0.1:${port}/health/ready" | grep -q '"runtime":"ok"'; then
         ready=1
         break
       fi
@@ -88,52 +153,54 @@ EOF
     done
 
     if [[ "$ready" -ne 1 ]]; then
-      echo "xiaohe core did not become ready on port ${port}; log:" >&2
+      echo "xiaohe core did not become ready with runtime=ok on port ${port}; core log:" >&2
       cat "$log_file" >&2
+      echo "supervisor log:" >&2
+      cat "$sup_log_file" >&2
       exit 1
     fi
 
-    echo "READY run_id=${run_id} pid=${pid} url=http://127.0.0.1:${port} scratch=${scratch_dir} evidence=${evidence_dir}"
+    echo "READY run_id=${run_id} core_pid=${pid} sup_pid=${sup_pid} url=http://127.0.0.1:${port} socket=${sock_file} scratch=${scratch_dir} evidence=${evidence_dir}"
     ;;
 
   doctor)
-    if [[ ! -f "$pid_file" || ! -f "$port_file" ]]; then
+    if [[ ! -f "$pid_file" || ! -f "$sup_pid_file" || ! -f "$port_file" ]]; then
       echo "UNHEALTHY: missing pid or port metadata in ${scratch_dir}" >&2
       exit 1
     fi
     pid="$(cat "$pid_file")"
+    sup_pid="$(cat "$sup_pid_file")"
     port="$(cat "$port_file")"
     if ! kill -0 "$pid" 2>/dev/null; then
-      echo "UNHEALTHY: PID ${pid} is not running" >&2
+      echo "UNHEALTHY: core PID ${pid} is not running" >&2
+      exit 1
+    fi
+    if ! kill -0 "$sup_pid" 2>/dev/null; then
+      echo "UNHEALTHY: supervisor PID ${sup_pid} is not running" >&2
+      exit 1
+    fi
+    if [[ ! -S "$sock_file" ]]; then
+      echo "UNHEALTHY: UDS socket missing at ${sock_file}" >&2
       exit 1
     fi
     ready_body="$(curl -sf "http://127.0.0.1:${port}/health/ready")" || {
       echo "UNHEALTHY: GET /health/ready failed on port ${port}" >&2
       exit 1
     }
+    if ! printf '%s' "$ready_body" | grep -q '"runtime":"ok"'; then
+      echo "UNHEALTHY: expected runtime=ok in /health/ready, got: ${ready_body}" >&2
+      exit 1
+    fi
     if [[ ! -f "${scratch_dir}/data/xiaohe.db" ]]; then
       echo "UNHEALTHY: expected SQLite DB missing at ${scratch_dir}/data/xiaohe.db" >&2
       exit 1
     fi
-    echo "DOCTOR_OK pid=${pid} url=http://127.0.0.1:${port} db=${scratch_dir}/data/xiaohe.db ready=${ready_body}"
+    echo "DOCTOR_OK core_pid=${pid} sup_pid=${sup_pid} url=http://127.0.0.1:${port} socket=${sock_file} db=${scratch_dir}/data/xiaohe.db ready=${ready_body}"
     ;;
 
   cleanup)
-    if [[ -f "$pid_file" ]]; then
-      pid="$(cat "$pid_file")"
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -TERM "$pid" 2>/dev/null || true
-        for _ in $(seq 1 25); do
-          if ! kill -0 "$pid" 2>/dev/null; then
-            break
-          fi
-          sleep 0.1
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-          kill -KILL "$pid" 2>/dev/null || true
-        fi
-      fi
-    fi
+    stop_pid_file "$pid_file"
+    stop_pid_file "$sup_pid_file"
     rm -rf "$scratch_dir"
     echo "CLEANED scratch=${scratch_dir} (evidence preserved at ${evidence_dir})"
     ;;
