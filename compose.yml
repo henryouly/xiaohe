@@ -8,6 +8,10 @@ services:
       - "4000:4000"
     environment:
       - STORAGE_BACKEND=${STORAGE_BACKEND:-}
+      - INFLUXDB_URL=${INFLUXDB_URL:-}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
       - RUNTIME_SOCKET=/run/xiaohe/rpc.sock
     volumes:
       - ./config:/config
@@ -32,7 +36,29 @@ services:
       - uv-cache:/var/cache/uv
     restart: unless-stopped
 
+  influxdb:
+    image: influxdb:2-alpine
+    profiles: ["influxdb"]
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USERNAME:-xiaohe}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD:-xiaohe-admin-password}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-xiaohe}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-xiaohe}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-xiaohe-dev-token}
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   xiaohe-data:
   runtime-ipc:
   uv-cache:
+  influxdb-data:

@@ -13,7 +13,7 @@ use crate::esphome::EspHomeManager;
 use crate::http::{self, AppState};
 use crate::protocol::rpc::PROTOCOL_VERSION;
 use crate::state::{EventBus, StateStore, spawn_history_writer};
-use crate::storage::{HistoryStore, StorageError, build_history_store};
+use crate::storage::{HistoryStore, StorageError, build_history_store_with_secrets};
 
 pub const DEFAULT_CONFIG_DIR: &str = "/config";
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -49,7 +49,7 @@ pub async fn run() -> Result<(), CoreError> {
     let users = config_store.load_users()?;
     let auth = crate::auth::AuthService::new(config_store.clone(), users);
 
-    let history = build_history_store(&system.storage).await?;
+    let history = build_history_store_with_secrets(&system.storage, &secrets).await?;
     let events = EventBus::new();
     let state = StateStore::new(events.clone());
 
