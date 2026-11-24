@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -17,28 +18,58 @@ enum Commands {
     Core,
     /// Run the Xiaohe Skill supervisor inside the xiaohe-runtime container.
     Supervisor,
+    /// Validate TOML configuration files, automations, and optional Skill manifests offline.
+    Validate {
+        /// Path to the config directory (defaults to CONFIG_DIR or /config).
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        /// Optional path to the skills directory (defaults to SKILLS_DIR if set).
+        #[arg(long)]
+        skills_dir: Option<PathBuf>,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    init_tracing();
-
     let cli = Cli::parse();
     match cli.command {
-        Commands::Core => match xiaohe::core::run().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                error!(error = %err, "xiaohe core failed to start");
+        Commands::Core => {
+            init_tracing();
+            match xiaohe::core::run().await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    error!(error = %err, "xiaohe core failed to start");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Supervisor => {
+            init_tracing();
+            match xiaohe::supervisor::run().await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    error!(error = %err, "xiaohe supervisor failed to start");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Validate {
+            config_dir,
+            skills_dir,
+            json,
+        } => {
+            let (cfg_dir, sk_dir) = xiaohe::validate::resolve_dirs(config_dir, skills_dir);
+            let report = xiaohe::validate::validate_workspace(&cfg_dir, sk_dir.as_deref());
+            print!("{}", xiaohe::validate::format_report(&report, json));
+            if report.is_valid() {
+                ExitCode::SUCCESS
+            } else {
                 ExitCode::FAILURE
             }
-        },
-        Commands::Supervisor => match xiaohe::supervisor::run().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                error!(error = %err, "xiaohe supervisor failed to start");
-                ExitCode::FAILURE
-            }
-        },
+        }
     }
 }
 

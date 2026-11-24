@@ -1,0 +1,20 @@
+[skill]
+id = "action-starter"
+name = "Starter Action Skill"
+version = "0.1.0"
+mode = "action"
+description = "Minimal Xiaohe on-demand Action Skill starter template"
+
+[runtime]
+type = "python-uv"
+python = ">=3.11"
+entrypoint = ["python", "src/main.py"]
+invoke_timeout_secs = 15
+
+[actions.ping_entity]
+description = "Read an entity's current state from Xiaohe Core and return a structured summary"
+
+[actions.ping_entity.params.entity_id]
+type = "string"
+required = true
+description = "Target entity_id to inspect"
