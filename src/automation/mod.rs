@@ -762,4 +762,296 @@ action = "turn_on"
         let _ = shutdown_tx.send(true);
         engine.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn regression_debounce_rearm_race_preserves_live_timer() {
+        use crate::storage::{HistoryStore, SqliteStore};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("motion.toml"),
+            r#"
+id = "motion_rearm"
+name = "Motion Rearm"
+
+[[triggers]]
+type = "state"
+entity_id = "binary_sensor.motion"
+from = "off"
+to = "on"
+for_secs = 1
+
+[[actions]]
+type = "entity.call"
+entity_id = "light.hall"
+action = "turn_on"
+"#,
+        )
+        .unwrap();
+
+        let history = Arc::new(SqliteStore::open(":memory:").await.unwrap());
+        let events = crate::state::EventBus::new();
+        let state = crate::state::StateStore::new(events.clone());
+        state.upsert_entity(make_binary_sensor("binary_sensor.motion", false));
+
+        let exec = Arc::new(RecordingExecutor::new(Duration::ZERO));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (engine, errs) = AutomationEngine::start(
+            dir.path(),
+            crate::config::LocationConfig::default(),
+            state.clone(),
+            events,
+            Arc::clone(&history) as Arc<dyn HistoryStore>,
+            Arc::clone(&exec) as Arc<dyn ActionExecutor>,
+            shutdown_rx,
+        );
+        assert!(errs.is_empty());
+
+        // Rapid bounce: off -> on -> off -> on without yielding long enough for cancelled timer cleanup
+        for active in [true, false, true] {
+            state.update_state(
+                "binary_sensor.motion",
+                crate::protocol::domain::DomainState::BinarySensor {
+                    active,
+                    device_class: Some("motion".into()),
+                },
+                None,
+                None,
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(
+            exec.calls(),
+            vec![("light.hall".to_owned(), "turn_on".to_owned())],
+            "re-armed debounce timer must fire after holding on for > 1s"
+        );
+
+        let _ = shutdown_tx.send(true);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn regression_queued_mode_drops_stale_rule_after_reload() {
+        use crate::storage::{HistoryStore, SqliteStore};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let rule_path = dir.path().join("queued.toml");
+        fs::write(
+            &rule_path,
+            r#"
+id = "queued_reload"
+name = "Queued Reload"
+mode = "queued"
+
+[[triggers]]
+type = "webhook"
+webhook_id = "w"
+
+[[actions]]
+type = "delay"
+secs = 1
+
+[[actions]]
+type = "entity.call"
+entity_id = "light.old_action"
+action = "turn_on"
+"#,
+        )
+        .unwrap();
+
+        let history = Arc::new(SqliteStore::open(":memory:").await.unwrap());
+        let events = crate::state::EventBus::new();
+        let state = crate::state::StateStore::new(events.clone());
+        let exec = Arc::new(RecordingExecutor::new(Duration::ZERO));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let (engine, errs) = AutomationEngine::start(
+            dir.path(),
+            crate::config::LocationConfig::default(),
+            state,
+            events,
+            Arc::clone(&history) as Arc<dyn HistoryStore>,
+            Arc::clone(&exec) as Arc<dyn ActionExecutor>,
+            shutdown_rx,
+        );
+        assert!(errs.is_empty());
+
+        // Trigger twice: 1st starts immediately (1s delay), 2nd is queued behind it.
+        engine.trigger_manual("queued_reload").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        engine.trigger_manual("queued_reload").await.unwrap();
+
+        // Delete rule and reload while 1st run is still in delay.
+        fs::remove_file(&rule_path).unwrap();
+        let (loaded, reload_errs) = engine.reload();
+        assert!(loaded.is_empty());
+        assert!(reload_errs.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert!(
+            exec.calls().len() <= 1,
+            "deleted rule must not start a queued second run after reload(), got: {:?}",
+            exec.calls()
+        );
+
+        let _ = shutdown_tx.send(true);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn regression_shutdown_waits_for_inflight_runs_and_audit_persistence() {
+        use crate::storage::{AutomationOutcome, HistoryStore, SqliteStore};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("slow.toml"),
+            r#"
+id = "slow_shutdown"
+name = "Slow Shutdown"
+
+[[triggers]]
+type = "webhook"
+webhook_id = "w"
+
+[[actions]]
+type = "entity.call"
+entity_id = "switch.step1"
+action = "turn_on"
+
+[[actions]]
+type = "delay"
+secs = 10
+"#,
+        )
+        .unwrap();
+
+        let history = Arc::new(SqliteStore::open(":memory:").await.unwrap());
+        let events = crate::state::EventBus::new();
+        let state = crate::state::StateStore::new(events.clone());
+        let exec = Arc::new(RecordingExecutor::new(Duration::from_millis(120)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let (engine, errs) = AutomationEngine::start(
+            dir.path(),
+            crate::config::LocationConfig::default(),
+            state,
+            events,
+            Arc::clone(&history) as Arc<dyn HistoryStore>,
+            Arc::clone(&exec) as Arc<dyn ActionExecutor>,
+            shutdown_rx,
+        );
+        assert!(errs.is_empty());
+
+        engine.trigger_manual("slow_shutdown").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let _ = shutdown_tx.send(true);
+        engine.shutdown().await;
+
+        // Immediately after shutdown() returns, the Cancelled audit record MUST already be persisted.
+        let runs = history
+            .query_automation_runs(Some("slow_shutdown"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, AutomationOutcome::Cancelled);
+    }
+
+    #[test]
+    fn regression_numeric_state_condition_rejects_nan_and_inf() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonfinite.toml");
+        fs::write(
+            &path,
+            r#"
+id = "nonfinite_cond"
+name = "Non-Finite Condition"
+
+[[triggers]]
+type = "webhook"
+webhook_id = "w"
+
+[[conditions]]
+type = "numeric_state"
+entity_id = "sensor.lux"
+above = nan
+below = inf
+
+[[actions]]
+type = "delay"
+secs = 1
+"#,
+        )
+        .unwrap();
+
+        let err = load_automation_file(&path, None)
+            .expect_err("nan/inf in numeric_state condition must fail validation");
+        assert!(matches!(err, AutomationError::Validation { .. }));
+    }
+
+    #[test]
+    fn regression_sun_condition_polar_day_and_non_utc_longitude() {
+        let events = crate::state::EventBus::new();
+        let state = crate::state::StateStore::new(events);
+
+        // 1. Polar day at Svalbard (78.22N, 15.63E) on June 21: no sunset -> after=sunset must be false
+        let polar_loc = crate::config::LocationConfig {
+            timezone: "UTC".into(),
+            latitude: Some(78.22),
+            longitude: Some(15.63),
+        };
+        let polar_noon = Utc.with_ymd_and_hms(2026, 6, 21, 12, 0, 0).unwrap();
+        let after_sunset = ConditionSpec::Sun {
+            after: Some(SunEvent::Sunset),
+            after_offset_minutes: 0,
+            before: None,
+            before_offset_minutes: 0,
+        };
+        assert!(
+            !evaluate_conditions(
+                std::slice::from_ref(&after_sunset),
+                &state,
+                &polar_loc,
+                polar_noon
+            ),
+            "polar day has no sunset; after=sunset must be false"
+        );
+
+        // 2. San Francisco (37.7749N, -122.4194W) on June 21:
+        //    - Local solar noon (~19:00 UTC = 12:00 PDT): after=sunset (-15m) MUST be false
+        //    - Local evening (~04:00 UTC = 21:00 PDT): after=sunset (-15m) MUST be true
+        let sf_loc = crate::config::LocationConfig {
+            timezone: "America/Los_Angeles".into(),
+            latitude: Some(37.7749),
+            longitude: Some(-122.4194),
+        };
+        let sf_after_sunset = ConditionSpec::Sun {
+            after: Some(SunEvent::Sunset),
+            after_offset_minutes: -15,
+            before: None,
+            before_offset_minutes: 0,
+        };
+        let sf_noon = Utc.with_ymd_and_hms(2026, 6, 21, 19, 0, 0).unwrap();
+        let sf_night = Utc.with_ymd_and_hms(2026, 6, 22, 4, 0, 0).unwrap();
+        assert!(
+            !evaluate_conditions(
+                std::slice::from_ref(&sf_after_sunset),
+                &state,
+                &sf_loc,
+                sf_noon
+            ),
+            "SF local noon (19:00 UTC) must NOT be after sunset"
+        );
+        assert!(
+            evaluate_conditions(&[sf_after_sunset], &state, &sf_loc, sf_night),
+            "SF local night (04:00 UTC) MUST be after sunset"
+        );
+    }
 }
