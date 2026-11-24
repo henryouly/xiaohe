@@ -1,6 +1,6 @@
 # Xiaohe verification map
 
-This directory is the maintained source for verifying the implemented user-facing behavior of Xiaohe (Phases 1–4: CLI, TOML configuration, SQLite WAL persistence, health probes, HTTP webhook ingestion, `xiaohe supervisor` ↔ UDS JSON-RPC 2.0 ↔ isolated Python Skills, and declarative TOML automations). Read this index before driving the app, then follow the matching feature file.
+This directory is the maintained source for verifying the implemented user-facing behavior of Xiaohe (Phases 1–5: CLI, TOML configuration, SQLite WAL persistence, health probes, HTTP webhook ingestion, `xiaohe supervisor` ↔ UDS JSON-RPC 2.0 ↔ isolated Python Skills, declarative TOML automations, multi-user Auth & area-scoped RBAC, full REST API, RBAC-filtered SSE, and OpenAPI 3.1 docs). Read this index before driving the app, then follow the matching feature file.
 
 ## Baseline preconditions
 
@@ -39,3 +39,5 @@ Each feature file has an H1 title, a one-paragraph user-POV description, and exa
 - [CLI & Configuration](./cli-and-config.md) covers `xiaohe --help`, `xiaohe supervisor` UDS startup/shutdown, unprefixed env overrides, and nonzero exit on malformed `system.toml`.
 - [Skill Runtime & UDS Bridge](./skill-runtime.md) covers `xiaohe supervisor` manifest scanning, `uv` environment isolation, auto-started `miio-airpurifier` (`demo_mode`), SQLite telemetry persistence from Python Skills, and `climate-optimizer` action invocation.
 - [Declarative TOML Automations](./automations.md) covers startup loading of `$CONFIG_DIR/automations/*.toml`, webhook-triggered `entity.call` + `skill.invoke` execution, and SQLite `automation_runs` audit logging.
+- [Multi-User Auth & RBAC](./auth-and-rbac.md) covers first-boot Admin bootstrap (`409` on repeat), Argon2id login & `HttpOnly; SameSite=Lax` `xiaohe_session` cookies, constant-time SHA-256 `xh_*` API Bearer tokens, Admin user management, last-Admin deletion protection (`409`), and logout revocation.
+- [REST API, RBAC-Filtered SSE & OpenAPI 3.1](./rest-sse-openapi.md) covers Areas CRUD, Entities/Commands/History, Skills & Automations Admin HTTP APIs, live RBAC-filtered `GET /api/events` SSE stream, and OpenAPI 3.1 `/api/openapi.json` + `/docs`.
