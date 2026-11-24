@@ -45,6 +45,8 @@ pub async fn run() -> Result<(), CoreError> {
     system.apply_env_overrides();
     let devices = config_store.load_devices()?;
     let secrets = config_store.load_secrets()?;
+    let users = config_store.load_users()?;
+    let auth = crate::auth::AuthService::new(config_store, users);
 
     let history = build_history_store(&system.storage).await?;
     let events = EventBus::new();
@@ -120,6 +122,7 @@ pub async fn run() -> Result<(), CoreError> {
         retention_days = retention_days,
         esphome_nodes = esphome_manager.active_node_count(),
         automations = automation_engine.list_rules().len(),
+        auth_initialized = auth.is_initialized(),
         runtime_socket = %system.runtime.socket_path,
         "xiaohe core listening"
     );
@@ -130,6 +133,7 @@ pub async fn run() -> Result<(), CoreError> {
         events,
         webhooks: Arc::new(system.webhooks),
         skills: Some(skill_bridge.clone()),
+        auth,
     });
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {

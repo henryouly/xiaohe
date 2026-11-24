@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod automation;
 pub mod config;
 pub mod core;
