@@ -54,12 +54,12 @@ pub async fn run() -> Result<(), CoreError> {
     let history_writer_handle =
         spawn_history_writer(Arc::clone(&history), &events, shutdown_rx.clone());
 
-    let esphome_manager = EspHomeManager::start(
+    let esphome_manager = Arc::new(EspHomeManager::start(
         &devices.esphome.nodes,
         &secrets,
         state.clone(),
         shutdown_rx.clone(),
-    );
+    ));
 
     let skill_bridge = crate::skills::SkillBridge::start(
         &system.runtime.socket_path,
@@ -69,6 +69,28 @@ pub async fn run() -> Result<(), CoreError> {
         events.clone(),
         shutdown_rx.clone(),
     );
+
+    let automations_dir = std::path::PathBuf::from(&config_dir).join("automations");
+    let action_executor = Arc::new(crate::automation::CoreActionExecutor::new(
+        state.clone(),
+        Some(skill_bridge.clone()),
+        Some(Arc::clone(&esphome_manager)),
+    ));
+    let (automation_engine, auto_errors) = crate::automation::AutomationEngine::start(
+        &automations_dir,
+        system.location.clone(),
+        state.clone(),
+        events.clone(),
+        Arc::clone(&history),
+        action_executor,
+        shutdown_rx.clone(),
+    );
+    if !auto_errors.is_empty() {
+        warn!(
+            error_count = auto_errors.len(),
+            "some automation TOML files failed validation"
+        );
+    }
 
     let retention_days = match system.storage.backend {
         StorageBackend::Sqlite => system.storage.sqlite.retention_days,
@@ -97,6 +119,7 @@ pub async fn run() -> Result<(), CoreError> {
         storage_backend = ?system.storage.backend,
         retention_days = retention_days,
         esphome_nodes = esphome_manager.active_node_count(),
+        automations = automation_engine.list_rules().len(),
         runtime_socket = %system.runtime.socket_path,
         "xiaohe core listening"
     );
@@ -115,6 +138,7 @@ pub async fn run() -> Result<(), CoreError> {
         })
         .await;
 
+    automation_engine.shutdown().await;
     skill_bridge.shutdown().await;
     esphome_manager.shutdown().await;
 

@@ -21,7 +21,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 32;
 /// Manages all configured ESPHome Native API node connections.
 pub struct EspHomeManager {
     senders: HashMap<String, mpsc::Sender<NodeCommand>>,
-    handles: Vec<JoinHandle<()>>,
+    handles: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl EspHomeManager {
@@ -97,7 +97,10 @@ impl EspHomeManager {
             handles.push(handle);
         }
 
-        Self { senders, handles }
+        Self {
+            senders,
+            handles: std::sync::Mutex::new(handles),
+        }
     }
 
     /// Dispatch a domain command to a specific ESPHome node and await write acknowledgment.
@@ -128,12 +131,16 @@ impl EspHomeManager {
     }
 
     pub fn active_node_count(&self) -> usize {
-        self.handles.len()
+        self.senders.len()
     }
 
     /// Wait for all ESPHome node actors to exit cleanly after shutdown is signaled.
-    pub async fn shutdown(self) {
-        for handle in self.handles {
+    pub async fn shutdown(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut guard = self.handles.lock().expect("esphome handles mutex poisoned");
+            std::mem::take(&mut *guard)
+        };
+        for handle in handles {
             if let Err(err) = handle.await {
                 warn!(error = %err, "ESPHome node actor exited abnormally");
             }
