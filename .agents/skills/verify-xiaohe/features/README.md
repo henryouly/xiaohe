@@ -1,6 +1,6 @@
 # Xiaohe verification map
 
-This directory is the maintained source for verifying the implemented user-facing behavior of Xiaohe (Phases 1–3: CLI, TOML configuration, SQLite WAL persistence, health probes, HTTP webhook ingestion, and `xiaohe supervisor` ↔ UDS JSON-RPC 2.0 ↔ isolated Python Skills). Read this index before driving the app, then follow the matching feature file.
+This directory is the maintained source for verifying the implemented user-facing behavior of Xiaohe (Phases 1–4: CLI, TOML configuration, SQLite WAL persistence, health probes, HTTP webhook ingestion, `xiaohe supervisor` ↔ UDS JSON-RPC 2.0 ↔ isolated Python Skills, and declarative TOML automations). Read this index before driving the app, then follow the matching feature file.
 
 ## Baseline preconditions
 
@@ -38,3 +38,4 @@ Each feature file has an H1 title, a one-paragraph user-POV description, and exa
 - [HTTP Webhooks](./webhooks.md) covers `POST /api/webhooks/{webhook_id}` with Bearer and `X-Webhook-Secret`, rejection codes (`401`/`404`/`400`/`413`), and header sanitization.
 - [CLI & Configuration](./cli-and-config.md) covers `xiaohe --help`, `xiaohe supervisor` UDS startup/shutdown, unprefixed env overrides, and nonzero exit on malformed `system.toml`.
 - [Skill Runtime & UDS Bridge](./skill-runtime.md) covers `xiaohe supervisor` manifest scanning, `uv` environment isolation, auto-started `miio-airpurifier` (`demo_mode`), SQLite telemetry persistence from Python Skills, and `climate-optimizer` action invocation.
+- [Declarative TOML Automations](./automations.md) covers startup loading of `$CONFIG_DIR/automations/*.toml`, webhook-triggered `entity.call` + `skill.invoke` execution, and SQLite `automation_runs` audit logging.

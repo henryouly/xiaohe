@@ -27,5 +27,5 @@ Preconditions:
 
 ## Gotchas
 
-- `HistoryWriter` flushes batches every 5 seconds (or immediately on `SIGTERM` shutdown). If `numeric_telemetry` is empty after 3 seconds, wait another 3 seconds or inspect after `SIGTERM` graceful shutdown.
+- `HistoryWriter` flushes batches every 500 ms (or immediately on `SIGTERM` shutdown or when batch size reaches 64). Wait ~2 seconds after launch for the 1 s poll plus flush before querying `numeric_telemetry`.
 - Physical Xiaomi Air Purifier hardware (`demo_mode = false`) requires a LAN device IP, 32-char `miio_token`, and `uv sync --extra miio`; report that path as skipped in hardware-free environments.

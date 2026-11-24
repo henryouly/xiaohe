@@ -97,6 +97,34 @@ poll_interval_secs = 1
 area_id = "living_room"
 EOF
 
+    # Seed a Phase 4 declarative TOML automation triggered by verify_hook.
+    mkdir -p "${scratch_dir}/config/automations"
+    cat > "${scratch_dir}/config/automations/webhook_purifier.toml" <<EOF
+id = "verify_webhook_purifier"
+name = "Verification Webhook Purifier Boost"
+enabled = true
+mode = "single"
+
+[[triggers]]
+type = "webhook"
+webhook_id = "verify_hook"
+
+[[actions]]
+type = "entity.call"
+entity_id = "switch.purifier_power"
+action = "turn_on"
+
+[[actions]]
+type = "skill.invoke"
+skill_id = "climate-optimizer"
+action = "evaluate_comfort"
+context_entities = ["sensor.purifier_temp", "sensor.purifier_humidity"]
+[actions.params]
+temp_entity = "sensor.purifier_temp"
+humidity_entity = "sensor.purifier_humidity"
+threshold_c = 24.0
+EOF
+
     (cd "$repo_root" && cargo build --quiet)
 
     # 1. Start xiaohe supervisor on isolated UDS socket
