@@ -24,12 +24,12 @@ Follow docs/skill_spec.md strictly:
    - src/main.py using xiaohe_sdk.SkillApp (JSON-RPC 2.0 over stdin/stdout; NEVER print logs to stdout, use stderr only!)
    - SKILL.md documenting config fields, secrets, entities/actions, and demo_mode testing
 2. For Device Skills:
-   - Register entities in @app.on_init via app.register_entity(...)
-   - Emit state updates via app.emit_state(entity_id, domain_state_dict)
-   - Handle commands in @app.on_command(entity_id, action, params)
+   - Register entities in @app.on_init via await app.register_entities(device={...}, entities=[...])
+   - Emit state updates via await app.emit_state(entity_id, domain_state_dict)
+   - Handle commands in @app.on_command() (note parentheses!)
    - Always include a `demo_mode = true` option for hardware-free verification.
 3. For Action Skills:
-   - Handle invocations in @app.on_invoke(action, params, context)
+   - Handle invocations in @app.on_invoke() (note parentheses!)
    - Read live entities with `await app.get_entity(entity_id)` and dispatch commands with `await app.call_entity(entity_id, action, params)`.
 4. Verify with `xiaohe validate --config-dir ./config --skills-dir ./skills` and a Python unit test.
 ```

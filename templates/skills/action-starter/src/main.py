@@ -6,16 +6,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_SDK_SRC = Path(__file__).resolve().parents[4] / "sdk" / "python" / "src"
-if _SDK_SRC.is_dir() and str(_SDK_SRC) not in sys.path:
-    sys.path.insert(0, str(_SDK_SRC))
+for _parent in Path(__file__).resolve().parents:
+    _candidate = _parent / "sdk" / "python" / "src"
+    if _candidate.is_dir():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
 
 from xiaohe_sdk import SkillApp  # noqa: E402
 
 app = SkillApp()
 
 
-@app.on_invoke
+@app.on_invoke()
 async def handle_invoke(
     action: str, params: dict[str, Any], _context: dict[str, Any]
 ) -> dict[str, Any]:

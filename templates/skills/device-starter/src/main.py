@@ -7,9 +7,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_SDK_SRC = Path(__file__).resolve().parents[4] / "sdk" / "python" / "src"
-if _SDK_SRC.is_dir() and str(_SDK_SRC) not in sys.path:
-    sys.path.insert(0, str(_SDK_SRC))
+for _parent in Path(__file__).resolve().parents:
+    _candidate = _parent / "sdk" / "python" / "src"
+    if _candidate.is_dir():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
 
 from xiaohe_sdk import SkillApp  # noqa: E402
 
@@ -28,24 +31,31 @@ async def _poll_loop(interval: float) -> None:
 
 
 @app.on_init
-async def handle_init(config: dict[str, Any], _secrets: dict[str, str]) -> dict[str, Any]:
+async def handle_init(config: dict[str, Any], _secrets: dict[str, str]) -> None:
     global _poll_task
     area_id = str(config.get("area_id") or "living_room")
     interval = max(1.0, float(config.get("poll_interval_secs") or 15))
 
-    await app.register_entity(
-        entity_id="switch.starter_power",
-        name="Starter Power Switch",
-        domain="switch",
-        area_id=area_id,
-        state={"domain": "switch", "on": _power_on},
-        capabilities=["on_off"],
+    await app.register_entities(
+        device={
+            "id": "starter_device_1",
+            "name": "Starter Device",
+            "area_id": area_id,
+        },
+        entities=[
+            {
+                "entity_id": "switch.starter_power",
+                "name": "Starter Power Switch",
+                "area_id": area_id,
+                "state": {"domain": "switch", "on": _power_on},
+                "capabilities": ["on_off"],
+            }
+        ],
     )
     _poll_task = asyncio.create_task(_poll_loop(interval))
-    return {"entities": ["switch.starter_power"]}
 
 
-@app.on_command
+@app.on_command()
 async def handle_command(
     entity_id: str, action: str, _params: dict[str, Any]
 ) -> dict[str, Any]:
