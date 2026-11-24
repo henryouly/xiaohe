@@ -5,7 +5,7 @@ description: "Project-local verification skill that launches, health-checks, dri
 
 # Verify Xiaohe
 
-This skill drives the real `xiaohe` Rust binary (`xiaohe supervisor` + `xiaohe core`) against disposable config and SQLite directories to prove user-facing behavior across Phases 1–6. Read [features/README.md](features/README.md) first, then follow the matching feature recipe.
+This skill drives the real `xiaohe` Rust binary (`xiaohe supervisor`, `xiaohe core`, and `xiaohe validate`) against disposable config and SQLite directories to prove user-facing behavior across Phases 1–7. Read [features/README.md](features/README.md) first, then follow the matching feature recipe.
 
 ## Launch
 
