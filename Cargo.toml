@@ -10,6 +10,7 @@ description = "Lightweight, self-hosted smart home control platform"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +26,7 @@ toml = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
