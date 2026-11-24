@@ -77,7 +77,7 @@ struct SkillBridgeInner {
     socket_path: PathBuf,
     state: StateStore,
     events: EventBus,
-    secrets: Arc<SecretsConfig>,
+    secrets: std::sync::RwLock<SecretsConfig>,
     skill_configs: Arc<BTreeMap<String, SkillUserConfig>>,
     connected: AtomicBool,
     next_id: AtomicI64,
@@ -108,7 +108,7 @@ impl SkillBridge {
             socket_path: socket_path.into(),
             state,
             events,
-            secrets: Arc::new(secrets),
+            secrets: std::sync::RwLock::new(secrets),
             skill_configs: Arc::new(skill_configs),
             connected: AtomicBool::new(false),
             next_id: AtomicI64::new(1),
@@ -174,6 +174,11 @@ impl SkillBridge {
         Ok(val)
     }
 
+    /// Replace the in-memory secrets snapshot (e.g. after `PUT /api/skills/{id}/config`).
+    pub fn update_secrets(&self, secrets: SecretsConfig) {
+        *self.inner.secrets.write().expect("secrets rwlock poisoned") = secrets;
+    }
+
     /// Start (or restart) a `device` skill with **scoped secret injection**.
     pub async fn start_skill(
         &self,
@@ -181,7 +186,10 @@ impl SkillBridge {
         config: Map<String, Value>,
     ) -> Result<(), SkillBridgeError> {
         let declared = self.declared_secrets_for(skill_id).await?;
-        let scoped_secrets = resolve_scoped_secrets(&declared, &self.inner.secrets);
+        let scoped_secrets = {
+            let guard = self.inner.secrets.read().expect("secrets rwlock poisoned");
+            resolve_scoped_secrets(&declared, &guard)
+        };
         let params = SupervisorStartSkillParams {
             skill_id: skill_id.to_owned(),
             config,
@@ -262,7 +270,10 @@ impl SkillBridge {
         invoke: SkillInvokeParams,
     ) -> Result<Value, SkillBridgeError> {
         let declared = self.declared_secrets_for(skill_id).await?;
-        let scoped_secrets = resolve_scoped_secrets(&declared, &self.inner.secrets);
+        let scoped_secrets = {
+            let guard = self.inner.secrets.read().expect("secrets rwlock poisoned");
+            resolve_scoped_secrets(&declared, &guard)
+        };
         let params = SupervisorInvokeSkillParams {
             skill_id: skill_id.to_owned(),
             config,
