@@ -1,12 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex as AsyncMutex, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
@@ -198,9 +199,33 @@ struct EngineInner {
     executor: Arc<dyn ActionExecutor>,
     rules: StdMutex<Vec<AutomationConfig>>,
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<AutomationSlot>>>>,
-    debouncers: StdMutex<HashMap<DebounceKey, watch::Sender<bool>>>,
+    next_debounce_gen: AtomicU64,
+    debouncers: StdMutex<HashMap<DebounceKey, (u64, watch::Sender<bool>)>>,
     last_schedule_fired: StdMutex<HashMap<DebounceKey, i64>>,
+    in_flight_runs: AtomicUsize,
+    in_flight_notify: Notify,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+struct InFlightGuard {
+    inner: Arc<EngineInner>,
+}
+
+impl InFlightGuard {
+    fn acquire(inner: &Arc<EngineInner>) -> Self {
+        inner.in_flight_runs.fetch_add(1, Ordering::AcqRel);
+        Self {
+            inner: Arc::clone(inner),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.inner.in_flight_runs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.in_flight_notify.notify_waiters();
+        }
+    }
 }
 
 /// Background declarative TOML automation engine running inside `xiaohe core`.
@@ -231,8 +256,11 @@ impl AutomationEngine {
             executor,
             rules: StdMutex::new(Vec::new()),
             slots: StdMutex::new(HashMap::new()),
+            next_debounce_gen: AtomicU64::new(1),
             debouncers: StdMutex::new(HashMap::new()),
             last_schedule_fired: StdMutex::new(HashMap::new()),
+            in_flight_runs: AtomicUsize::new(0),
+            in_flight_notify: Notify::new(),
             shutdown_rx,
         });
 
@@ -284,7 +312,7 @@ impl AutomationEngine {
                 .debouncers
                 .lock()
                 .expect("debouncers mutex poisoned");
-            for (_, tx) in debouncers.drain() {
+            for (_, (_, tx)) in debouncers.drain() {
                 let _ = tx.send(true);
             }
         }
@@ -325,7 +353,8 @@ impl AutomationEngine {
         Ok(())
     }
 
-    /// Gracefully wait for background automation loops to exit after `shutdown_rx` fires.
+    /// Gracefully wait for background automation loops and all in-flight runs to exit and persist
+    /// their audit records after `shutdown_rx` fires.
     pub async fn shutdown(&self) {
         {
             let mut debouncers = self
@@ -333,8 +362,25 @@ impl AutomationEngine {
                 .debouncers
                 .lock()
                 .expect("debouncers mutex poisoned");
-            for (_, tx) in debouncers.drain() {
+            for (_, (_, tx)) in debouncers.drain() {
                 let _ = tx.send(true);
+            }
+        }
+
+        // Cancel any active runs and clear pending queues.
+        let slots: Vec<Arc<AsyncMutex<AutomationSlot>>> = self
+            .inner
+            .slots
+            .lock()
+            .expect("slots mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for slot in slots {
+            let mut guard = slot.lock().await;
+            guard.queue.clear();
+            for active in &guard.active {
+                let _ = active.cancel_tx.send(true);
             }
         }
 
@@ -346,6 +392,15 @@ impl AutomationEngine {
             if let Err(err) = handle.await {
                 warn!(error = %err, "automation engine task join error");
             }
+        }
+
+        // Wait until every spawned run has completed and persisted its AutomationRunRecord.
+        loop {
+            let notified = self.inner.in_flight_notify.notified();
+            if self.inner.in_flight_runs.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            notified.await;
         }
     }
 }
@@ -608,7 +663,7 @@ async fn handle_core_event(inner: &Arc<EngineInner>, event: CoreEvent) {
 }
 
 fn cancel_debouncer(inner: &EngineInner, key: &DebounceKey) {
-    if let Some(tx) = inner
+    if let Some((_, tx)) = inner
         .debouncers
         .lock()
         .expect("debouncers mutex poisoned")
@@ -626,10 +681,11 @@ fn arm_debouncer(
     for_secs: u64,
     summary: String,
 ) {
+    let my_gen = inner.next_debounce_gen.fetch_add(1, Ordering::Relaxed);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     {
         let mut guard = inner.debouncers.lock().expect("debouncers mutex poisoned");
-        if let Some(prev) = guard.insert(key.clone(), cancel_tx) {
+        if let Some((_, prev)) = guard.insert(key.clone(), (my_gen, cancel_tx)) {
             let _ = prev.send(true);
         }
     }
@@ -649,12 +705,13 @@ fn arm_debouncer(
             () = tokio::time::sleep(Duration::from_secs(for_secs)) => true,
         };
 
-        // Remove ourselves if we're still the registered timer.
-        inner
-            .debouncers
-            .lock()
-            .expect("debouncers mutex poisoned")
-            .remove(&key);
+        // Remove our entry ONLY if a newer timer hasn't already replaced us.
+        {
+            let mut guard = inner.debouncers.lock().expect("debouncers mutex poisoned");
+            if guard.get(&key).is_some_and(|(g, _)| *g == my_gen) {
+                guard.remove(&key);
+            }
+        }
 
         if !elapsed {
             return;
@@ -732,9 +789,11 @@ async fn dispatch_trigger(
                 run_id: run_id.clone(),
                 cancel_tx,
             });
+            let flight = InFlightGuard::acquire(&inner);
             drop(guard);
 
             tokio::spawn(async move {
+                let _flight = flight;
                 execute_run(inner, slot, rule, run_id, trigger_summary, cancel_rx).await;
             });
         }
@@ -749,9 +808,11 @@ async fn dispatch_trigger(
                 run_id: run_id.clone(),
                 cancel_tx,
             });
+            let flight = InFlightGuard::acquire(&inner);
             drop(guard);
 
             tokio::spawn(async move {
+                let _flight = flight;
                 execute_run(inner, slot, rule, run_id, trigger_summary, cancel_rx).await;
             });
         }
@@ -771,21 +832,42 @@ async fn dispatch_trigger(
             }
             guard.queue_worker_running = true;
             guard.queue.push_back(PendingTrigger { trigger_summary });
+            let flight = InFlightGuard::acquire(&inner);
+            let automation_id = rule.id.clone();
             drop(guard);
 
             tokio::spawn(async move {
+                let _flight = flight;
                 loop {
                     let next = {
                         let mut guard = slot.lock().await;
                         match guard.queue.pop_front() {
                             Some(item) => {
-                                let run_id = new_run_id();
-                                let (cancel_tx, cancel_rx) = watch::channel(false);
-                                guard.active.push(ActiveRun {
-                                    run_id: run_id.clone(),
-                                    cancel_tx,
-                                });
-                                Some((item, run_id, cancel_rx))
+                                // Re-fetch the latest active rule so deleted/disabled rules after
+                                // reload() are never executed from a stale queue entry.
+                                let live_rule = inner
+                                    .rules
+                                    .lock()
+                                    .expect("rules mutex poisoned")
+                                    .iter()
+                                    .find(|r| r.id == automation_id && r.enabled)
+                                    .cloned();
+                                match live_rule {
+                                    Some(live) => {
+                                        let run_id = new_run_id();
+                                        let (cancel_tx, cancel_rx) = watch::channel(false);
+                                        guard.active.push(ActiveRun {
+                                            run_id: run_id.clone(),
+                                            cancel_tx,
+                                        });
+                                        Some((live, item, run_id, cancel_rx))
+                                    }
+                                    None => {
+                                        guard.queue.clear();
+                                        guard.queue_worker_running = false;
+                                        None
+                                    }
+                                }
                             }
                             None => {
                                 guard.queue_worker_running = false;
@@ -793,13 +875,13 @@ async fn dispatch_trigger(
                             }
                         }
                     };
-                    let Some((item, run_id, cancel_rx)) = next else {
+                    let Some((live_rule, item, run_id, cancel_rx)) = next else {
                         break;
                     };
                     execute_run(
                         Arc::clone(&inner),
                         Arc::clone(&slot),
-                        rule.clone(),
+                        live_rule,
                         run_id,
                         item.trigger_summary,
                         cancel_rx,
@@ -839,9 +921,11 @@ async fn dispatch_trigger(
                 run_id: run_id.clone(),
                 cancel_tx,
             });
+            let flight = InFlightGuard::acquire(&inner);
             drop(guard);
 
             tokio::spawn(async move {
+                let _flight = flight;
                 execute_run(inner, slot, rule, run_id, trigger_summary, cancel_rx).await;
             });
         }
@@ -1193,16 +1277,34 @@ fn evaluate_condition(
             let (Some(lat), Some(lon)) = (location.latitude, location.longitude) else {
                 return false;
             };
-            let date = now.date_naive();
-            let after_t = after.and_then(|ev| {
-                compute_sun_time_utc(date, lat, lon, ev)
-                    .map(|t| t + ChronoDuration::minutes(i64::from(*after_offset_minutes)))
-            });
-            let before_t = before.and_then(|ev| {
-                compute_sun_time_utc(date, lat, lon, ev)
-                    .map(|t| t + ChronoDuration::minutes(i64::from(*before_offset_minutes)))
-            });
-            time_in_window(now.time(), after_t, before_t)
+            // Shift into local solar time (lon / 15° hours) so sunrise (~06:00) and sunset (~18:00)
+            // never wrap across 00:00 UTC for non-UTC longitudes.
+            let solar_offset = ChronoDuration::seconds((lon / 15.0 * 3600.0).round() as i64);
+            let local_now = now + solar_offset;
+            let local_date = local_now.date_naive();
+
+            let after_t = match after {
+                Some(ev) => match compute_sun_time_utc(local_date, lat, lon, *ev) {
+                    Some(t) => Some(
+                        t + solar_offset
+                            + ChronoDuration::minutes(i64::from(*after_offset_minutes)),
+                    ),
+                    // Polar day / polar night: requested solar event does not occur.
+                    None => return false,
+                },
+                None => None,
+            };
+            let before_t = match before {
+                Some(ev) => match compute_sun_time_utc(local_date, lat, lon, *ev) {
+                    Some(t) => Some(
+                        t + solar_offset
+                            + ChronoDuration::minutes(i64::from(*before_offset_minutes)),
+                    ),
+                    None => return false,
+                },
+                None => None,
+            };
+            time_in_window(local_now.time(), after_t, before_t)
         }
         ConditionSpec::And { conditions } => conditions
             .iter()

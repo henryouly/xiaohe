@@ -290,6 +290,11 @@ fn validate_condition(
                     "{path}: numeric_state condition requires at least one of 'above' or 'below'"
                 ));
             }
+            if above.is_some_and(|v| !v.is_finite()) || below.is_some_and(|v| !v.is_finite()) {
+                errors.push(format!(
+                    "{path}: numeric_state thresholds must be finite numbers"
+                ));
+            }
             if let (Some(a), Some(b)) = (above, below)
                 && a >= b
             {
