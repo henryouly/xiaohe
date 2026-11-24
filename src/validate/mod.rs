@@ -280,16 +280,21 @@ pub fn validate_workspace(
 
     // 6. Optional skills directory manifests
     let mut ctx = ValidationContext::default();
-    if let Some(sdir) = skills_dir
-        && sdir.exists()
-    {
-        let (skills, errors) = scan_skills_dir(sdir);
-        report.skills_checked = skills.len() + errors.len();
-        for skill in &skills {
-            ctx.known_skills.insert(skill.manifest.skill.id.clone());
-        }
-        for err in errors {
-            report.error(sdir.display().to_string(), err.to_string());
+    if let Some(sdir) = skills_dir {
+        if !sdir.is_dir() {
+            report.error(
+                sdir.display().to_string(),
+                "skills directory does not exist or is not a directory",
+            );
+        } else {
+            let (skills, errors) = scan_skills_dir(sdir);
+            report.skills_checked = skills.len() + errors.len();
+            for skill in &skills {
+                ctx.known_skills.insert(skill.manifest.skill.id.clone());
+            }
+            for err in errors {
+                report.error(sdir.display().to_string(), err.to_string());
+            }
         }
     }
 
@@ -473,5 +478,16 @@ name = "Bad"
         let json_out = format_report(&broken, true);
         let parsed: serde_json::Value = serde_json::from_str(&json_out).expect("valid json");
         assert!(parsed["diagnostics"].as_array().unwrap().len() >= 3);
+
+        // Regression: explicit nonexistent skills_dir must report an error
+        let missing_skills = dir.path().join("does_not_exist");
+        let rep = validate_workspace(dir.path(), Some(&missing_skills));
+        assert!(!rep.is_valid());
+        assert!(
+            rep.diagnostics
+                .iter()
+                .any(|d| d.level == DiagnosticLevel::Error
+                    && d.message.contains("skills directory does not exist"))
+        );
     }
 }

@@ -191,7 +191,7 @@ impl HistoryStore for InfluxDbStore {
     }
 
     async fn record_automation_run(&self, run: &AutomationRunRecord) -> Result<(), StorageError> {
-        let line = encode_automation_run_line(run);
+        let line = encode_automation_run_line(run)?;
         self.write_lines(&line).await
     }
 
@@ -214,6 +214,7 @@ impl HistoryStore for InfluxDbStore {
         let entity_lit = escape_flux_string(entity_id);
 
         // 1. Try numeric telemetry first (raw or downsampled via aggregateWindow).
+        // `unit` is stored as a tag on `numeric_telemetry` so aggregateWindow preserves it.
         let numeric_flux = match bucket_seconds {
             Some(secs) => format!(
                 r#"base = from(bucket: "{bucket_lit}")
@@ -224,6 +225,7 @@ min_t = base |> aggregateWindow(every: {secs}s, fn: min, createEmpty: false) |> 
 max_t = base |> aggregateWindow(every: {secs}s, fn: max, createEmpty: false) |> set(key: "_field", value: "max")
 union(tables: [mean_t, min_t, max_t])
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> group()
   |> sort(columns: ["_time"])"#
             ),
             None => format!(
@@ -231,6 +233,7 @@ union(tables: [mean_t, min_t, max_t])
   |> range(start: {start}, stop: {stop})
   |> filter(fn: (r) => r._measurement == "numeric_telemetry" and r.entity_id == "{entity_lit}")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> group()
   |> sort(columns: ["_time"])"#
             ),
         };
@@ -278,6 +281,7 @@ union(tables: [mean_t, min_t, max_t])
             r#"from(bucket: "{bucket_lit}")
   |> range(start: {start}, stop: {stop})
   |> filter(fn: (r) => r._measurement == "entity_state_history" and r.entity_id == "{entity_lit}" and r._field == "state")
+  |> group()
   |> sort(columns: ["_time"])"#
         );
         let discrete_csv = self.query_flux(&discrete_flux).await?;
@@ -320,6 +324,7 @@ union(tables: [mean_t, min_t, max_t])
   |> range(start: 0)
   |> filter(fn: (r) => r._measurement == "automation_runs"{id_filter})
   |> pivot(rowKey: ["_time", "run_id", "automation_id", "outcome"], columnKey: ["_field"], valueColumn: "_value")
+  |> group()
   |> sort(columns: ["_time"], desc: true)
   |> limit(n: {limit}, offset: {offset})"#
         );
@@ -440,13 +445,15 @@ pub(crate) fn escape_lp_string(input: &str) -> String {
     out
 }
 
-/// Escape a Flux double-quoted string literal to prevent query injection.
+/// Escape a Flux double-quoted string literal to prevent query and string-interpolation injection.
 pub(crate) fn escape_flux_string(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -467,11 +474,12 @@ pub(crate) fn encode_state_entry_line(entry: &StateHistoryEntry) -> Option<Strin
             if !value.is_finite() {
                 return None;
             }
-            let _ = write!(line, "numeric_telemetry,entity_id={entity} value={value}");
+            // Store `unit` as a tag so Flux `aggregateWindow` preserves it during downsampling.
+            let _ = write!(line, "numeric_telemetry,entity_id={entity}");
             if let Some(u) = unit.as_deref().filter(|s| !s.is_empty()) {
-                let _ = write!(line, ",unit=\"{}\"", escape_lp_string(u));
+                let _ = write!(line, ",unit={}", escape_lp_tag(u));
             }
-            let _ = write!(line, " {}", entry.ts);
+            let _ = write!(line, " value={value} {}", entry.ts);
         }
         HistoryEntryKind::Discrete { state, attributes } => {
             let _ = write!(
@@ -489,12 +497,21 @@ pub(crate) fn encode_state_entry_line(entry: &StateHistoryEntry) -> Option<Strin
     Some(line)
 }
 
-pub(crate) fn encode_automation_run_line(run: &AutomationRunRecord) -> String {
+pub(crate) fn encode_automation_run_line(
+    run: &AutomationRunRecord,
+) -> Result<String, StorageError> {
+    let auto_tag = escape_lp_tag(&run.automation_id);
+    let run_tag = escape_lp_tag(&run.run_id);
+    if auto_tag.is_empty() || run_tag.is_empty() {
+        return Err(StorageError::InvalidQuery(
+            "automation_id and run_id must be non-empty".into(),
+        ));
+    }
     let steps_json = run.steps.to_string();
     let mut line = format!(
         "automation_runs,automation_id={},run_id={},outcome={} trigger_source=\"{}\",conditions_passed={},started_at={}i,finished_at={}i,steps=\"{}\"",
-        escape_lp_tag(&run.automation_id),
-        escape_lp_tag(&run.run_id),
+        auto_tag,
+        run_tag,
         escape_lp_tag(run.outcome.as_str()),
         escape_lp_string(&run.trigger_source),
         run.conditions_passed,
@@ -506,7 +523,7 @@ pub(crate) fn encode_automation_run_line(run: &AutomationRunRecord) -> String {
         let _ = write!(line, ",error=\"{}\"", escape_lp_string(err));
     }
     let _ = write!(line, " {}", run.started_at);
-    line
+    Ok(line)
 }
 
 fn ms_to_rfc3339(ms: i64) -> Result<String, StorageError> {
@@ -521,30 +538,28 @@ fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-/// Minimal RFC-4180 CSV parser for InfluxDB v2 annotated CSV responses.
-/// Skips `#datatype`, `#group`, `#default` annotation lines and empty table-separator lines,
-/// re-reading headers whenever a new result table begins.
+/// RFC-4180 CSV parser for InfluxDB v2 annotated CSV responses.
+/// Properly handles embedded newlines/commas/escaped quotes inside quoted fields,
+/// skips `#datatype`/`#group`/`#default` annotation rows, and resets headers on blank separator rows.
 pub(crate) fn parse_influx_csv(csv: &str) -> Vec<HashMap<String, String>> {
+    let records = split_csv_records(csv);
     let mut rows = Vec::new();
     let mut headers: Option<Vec<String>> = None;
 
-    for raw_line in csv.lines() {
-        let line = raw_line.trim_end_matches('\r');
-        if line.is_empty() {
+    for fields in records {
+        if fields.len() == 1 && fields[0].is_empty() {
             // Blank line separates Flux result tables; reset header state.
             headers = None;
             continue;
         }
-        if line.starts_with('#') {
+        if fields.first().is_some_and(|f| f.starts_with('#')) {
             continue;
         }
-        let fields = split_csv_line(line);
         if headers.is_none() {
             headers = Some(fields);
             continue;
         }
         if let Some(ref cols) = headers {
-            // Repeated header row inside same stream
             if fields == *cols {
                 continue;
             }
@@ -563,11 +578,13 @@ pub(crate) fn parse_influx_csv(csv: &str) -> Vec<HashMap<String, String>> {
     rows
 }
 
-fn split_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
+fn split_csv_records(input: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
+    let mut field_started = false;
+    let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if in_quotes {
@@ -581,20 +598,44 @@ fn split_csv_line(line: &str) -> Vec<String> {
             } else {
                 cur.push(ch);
             }
-        } else {
-            match ch {
-                ',' => {
-                    fields.push(std::mem::take(&mut cur));
+            continue;
+        }
+
+        match ch {
+            ',' => {
+                record.push(std::mem::take(&mut cur));
+                field_started = false;
+            }
+            '"' if !field_started => {
+                in_quotes = true;
+                field_started = true;
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
                 }
-                '"' if cur.is_empty() => {
-                    in_quotes = true;
-                }
-                _ => cur.push(ch),
+                record.push(std::mem::take(&mut cur));
+                records.push(std::mem::take(&mut record));
+                field_started = false;
+            }
+            '\n' => {
+                record.push(std::mem::take(&mut cur));
+                records.push(std::mem::take(&mut record));
+                field_started = false;
+            }
+            _ => {
+                cur.push(ch);
+                field_started = true;
             }
         }
     }
-    fields.push(cur);
-    fields
+
+    if !cur.is_empty() || !record.is_empty() {
+        record.push(cur);
+        records.push(record);
+    }
+
+    records
 }
 
 #[cfg(test)]
@@ -687,7 +728,7 @@ mod tests {
         let line = encode_state_entry_line(&entry).expect("encoded");
         assert_eq!(
             line,
-            r#"numeric_telemetry,entity_id=sensor.living\ room\,pm\=2.5 value=23.5,unit="ug/m3 \"raw\"" 1700000000000"#
+            r#"numeric_telemetry,entity_id=sensor.living\ room\,pm\=2.5,unit=ug/m3\ "raw" value=23.5 1700000000000"#
         );
 
         let nan_entry = StateHistoryEntry {
@@ -701,9 +742,33 @@ mod tests {
         assert!(encode_state_entry_line(&nan_entry).is_none());
 
         assert_eq!(
-            escape_flux_string(r#"foo") |> drop() // "#),
-            r#"foo\") |> drop() // "#
+            escape_flux_string(r#"foo") |> drop() // ${r.entity_id}"#),
+            r#"foo\") |> drop() // \${r.entity_id}"#
         );
+
+        // Regression: empty automation_id or run_id must be rejected instead of emitting invalid LP
+        let empty_run = AutomationRunRecord {
+            run_id: String::new(),
+            automation_id: String::new(),
+            trigger_source: "manual".into(),
+            conditions_passed: true,
+            outcome: AutomationOutcome::Succeeded,
+            started_at: 1_700_000_000_000,
+            finished_at: 1_700_000_000_120,
+            steps: json!([]),
+            error: None,
+        };
+        assert!(encode_automation_run_line(&empty_run).is_err());
+
+        // Regression: RFC-4180 multi-line quoted CSV fields with blank lines parse intact
+        let multiline_csv = ",result,table,_time,run_id,error\r\n,,0,2023-11-14T22:13:20Z,run_1,\"Traceback:\n\nValueError: bad \"\"payload\"\"\"\r\n,,0,2023-11-14T22:13:25Z,run_2,\r\n";
+        let parsed = parse_influx_csv(multiline_csv);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].get("error").map(String::as_str),
+            Some("Traceback:\n\nValueError: bad \"payload\"")
+        );
+        assert_eq!(parsed[1].get("run_id").map(String::as_str), Some("run_2"));
     }
 
     #[tokio::test]
@@ -744,9 +809,7 @@ mod tests {
             .expect("write batch");
         let writes = mock_state.writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 1);
-        assert!(
-            writes[0].contains("numeric_telemetry,entity_id=sensor.temp value=22.5,unit=\"C\"")
-        );
+        assert!(writes[0].contains("numeric_telemetry,entity_id=sensor.temp,unit=C value=22.5"));
         assert!(writes[0].contains("entity_state_history,entity_id=light.living state=\"on\""));
 
         // 3. Query downsampled numeric series from annotated CSV
@@ -782,7 +845,7 @@ mod tests {
             other => panic!("expected numeric series, got {other:?}"),
         }
 
-        // 4. Record and query automation run
+        // 4. Record and query automation run (verify |> group() precedes sort/limit)
         store
             .record_automation_run(&AutomationRunRecord {
                 run_id: "run_1".into(),
@@ -810,6 +873,15 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, "run_1");
         assert_eq!(runs[0].outcome, AutomationOutcome::Succeeded);
+        assert!(
+            mock_state
+                .queries
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("|> group()\n  |> sort(")
+        );
 
         // 5. Prune before cutoff issues /api/v2/delete for all 3 measurements
         store
