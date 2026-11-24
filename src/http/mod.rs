@@ -1304,4 +1304,434 @@ action = "turn_on"
             "forbidden event leaked to member SSE: {chunk}"
         );
     }
+
+    #[tokio::test]
+    async fn regression_sse_live_area_revocation_and_demotion_terminates_stream() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], false).await;
+        let events = fixture.state.events.clone();
+        let app = build_router(fixture.state);
+        let admin_cookie = bootstrap_admin_cookie(&app).await;
+
+        // Create member alice with access to both living_room and bedroom
+        let create_alice = app
+            .clone()
+            .oneshot(
+                Request::post("/api/users")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"alice","display_name":"Alice","password":"password123","role":"member","allowed_areas":["living_room","bedroom"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_alice.status(), StatusCode::CREATED);
+        let alice_id = json_body(create_alice).await["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mint = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/users/{alice_id}/tokens"))
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"sse"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let alice_token = json_body(mint).await["token"].as_str().unwrap().to_owned();
+
+        // Open SSE stream for alice
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::get("/api/events")
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut body = sse.into_body();
+
+        // Revoke bedroom from alice while stream is open
+        let narrow = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/users/{alice_id}"))
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"allowed_areas":["living_room"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(narrow.status(), StatusCode::OK);
+
+        // Publish bedroom (now forbidden) then living_room (still allowed)
+        events.publish(CoreEvent::EntityStateChanged {
+            entity_id: "light.bedroom".into(),
+            area_id: Some("bedroom".into()),
+            old_state: None,
+            new_state: DomainState::Light {
+                on: true,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+            extra: serde_json::Map::new(),
+            at: 1,
+        });
+        events.publish(CoreEvent::EntityStateChanged {
+            entity_id: "light.living".into(),
+            area_id: Some("living_room".into()),
+            old_state: None,
+            new_state: DomainState::Light {
+                on: true,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+            extra: serde_json::Map::new(),
+            at: 2,
+        });
+
+        let frame = timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("frame")
+            .expect("some")
+            .expect("ok");
+        let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(chunk.contains("light.living"), "got: {chunk}");
+        assert!(
+            !chunk.contains("light.bedroom"),
+            "revoked area leaked: {chunk}"
+        );
+
+        // Delete alice -> stream must terminate cleanly on next event without emitting it
+        let del = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/users/{alice_id}"))
+                    .header("cookie", &admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+        events.publish(CoreEvent::EntityStateChanged {
+            entity_id: "light.living".into(),
+            area_id: Some("living_room".into()),
+            old_state: None,
+            new_state: DomainState::Light {
+                on: false,
+                brightness: None,
+                color_temp_k: None,
+                rgb: None,
+            },
+            extra: serde_json::Map::new(),
+            at: 3,
+        });
+        let next = timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("stream should close promptly");
+        assert!(
+            next.is_none(),
+            "expected SSE stream to close after user deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_demoted_bootstrapped_admin_to_guest_cannot_control_locks() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], false).await;
+        fixture.state.state.upsert_entity(make_entity(
+            "lock.living",
+            "Front Door",
+            Some("living_room"),
+            DomainState::Lock {
+                state: LockState::Locked,
+            },
+        ));
+        let app = build_router(fixture.state);
+
+        // Bootstrap first admin
+        let boot = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin1","password":"password123","display_name":"Admin 1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boot.status(), StatusCode::CREATED);
+        let admin1_cookie = boot
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let admin1_id = json_body(boot).await["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Create second admin so admin1 can be demoted to Guest
+        let admin2_token =
+            create_user_and_token(&app, &admin1_cookie, "admin2", "admin", &[]).await;
+        let demote = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/users/{admin1_id}"))
+                    .header("authorization", format!("Bearer {admin2_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"role":"guest","allowed_areas":["living_room"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(demote.status(), StatusCode::OK);
+
+        // Re-login as demoted admin1 (now Guest) and attempt to unlock lock.living -> 403
+        let relogin = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin1","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relogin.status(), StatusCode::OK);
+        let guest_cookie = relogin
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let cmd = app
+            .clone()
+            .oneshot(
+                Request::post("/api/entities/lock.living/command")
+                    .header("cookie", &guest_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"action":"unlock"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cmd.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn regression_auth_rollback_on_save_failure_and_login_password_change_race() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], false).await;
+        let auth = fixture.state.auth.clone();
+        let users_path = fixture._dir.path().join("users.toml");
+
+        // Block users.toml write by placing a directory at its path
+        std::fs::create_dir(&users_path).expect("create blocking dir");
+        assert!(
+            auth.bootstrap_admin("admin", "password123", "Admin")
+                .is_err()
+        );
+        assert!(
+            !auth.is_initialized(),
+            "failed bootstrap must roll back in-memory users"
+        );
+
+        // Remove blocker and retry -> succeeds
+        std::fs::remove_dir(&users_path).expect("remove blocking dir");
+        let (admin, _) = auth
+            .bootstrap_admin("admin", "password123", "Admin")
+            .expect("retry bootstrap should succeed");
+
+        // Concurrent login with old password vs password change: no surviving old-password session
+        let auth_login = auth.clone();
+        let auth_update = auth.clone();
+        let admin_id = admin.id.clone();
+        let login_task =
+            tokio::task::spawn_blocking(move || auth_login.login("admin", "password123"));
+        let update_task = tokio::task::spawn_blocking(move || {
+            auth_update.update_user(
+                &admin_id,
+                crate::auth::UpdateUserInput {
+                    password: Some("new_password_456".into()),
+                    ..Default::default()
+                },
+            )
+        });
+        let (login_res, update_res) = tokio::join!(login_task, update_task);
+        update_res.unwrap().expect("password update succeeds");
+        if let Ok((_, sid)) = login_res.unwrap() {
+            assert!(
+                auth.authenticate_session(&sid).is_none(),
+                "session minted with old password must not survive password change"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_automations_no_file_clobber_and_skills_config_preserve_and_rollback() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], true).await;
+        let auto_dir = fixture._dir.path().join("automations");
+        let devices_path = fixture._dir.path().join("devices.toml");
+
+        // Pre-seed morning.toml whose rule id is "wake_up"
+        let wake_up_toml = r#"
+id = "wake_up"
+name = "Wake Up"
+enabled = true
+
+[[triggers]]
+type = "webhook"
+webhook_id = "hook1"
+
+[[actions]]
+type = "entity.call"
+entity_id = "light.living"
+action = "turn_on"
+"#;
+        std::fs::write(auto_dir.join("morning.toml"), wake_up_toml).expect("write morning.toml");
+        fixture.state.automations.as_ref().unwrap().reload();
+
+        let devices_arc = fixture.state.devices.clone();
+        let app = build_router(fixture.state);
+        let admin_cookie = bootstrap_admin_cookie(&app).await;
+
+        let clobber_toml = wake_up_toml.replace("wake_up", "morning");
+
+        // 1. POST /api/automations with id = "morning" must return 409 and NOT overwrite morning.toml
+        let post_clobber = app
+            .clone()
+            .oneshot(
+                Request::post("/api/automations")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"raw_toml": clobber_toml}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_clobber.status(), StatusCode::CONFLICT);
+
+        // 2. PUT /api/automations/morning (nonexistent id) must return 404 and NOT overwrite morning.toml
+        let put_clobber = app
+            .clone()
+            .oneshot(
+                Request::put("/api/automations/morning")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"raw_toml": clobber_toml}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put_clobber.status(), StatusCode::NOT_FOUND);
+
+        // Verify wake_up is still intact
+        let get_wake = app
+            .clone()
+            .oneshot(
+                Request::get("/api/automations/wake_up")
+                    .header("cookie", &admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_wake.status(), StatusCode::OK);
+
+        // 3. PUT /api/skills/miio/config sets host, then omitting config preserves host
+        let set_cfg = app
+            .clone()
+            .oneshot(
+                Request::put("/api/skills/miio/config")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"enabled":true,"config":{"host":"192.168.1.42"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(set_cfg.status(), StatusCode::OK);
+
+        let update_secret_only = app
+            .clone()
+            .oneshot(
+                Request::put("/api/skills/miio/config")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"secrets":{"MIIO_TOKEN":"abc"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_secret_only.status(), StatusCode::OK);
+        {
+            let guard = devices_arc.read().unwrap();
+            assert_eq!(
+                guard.skills["miio"]
+                    .config
+                    .get("host")
+                    .and_then(|v| v.as_str()),
+                Some("192.168.1.42")
+            );
+        }
+
+        // 4. Failed save_devices must roll back in-memory devices config
+        std::fs::remove_file(&devices_path).ok();
+        std::fs::create_dir(&devices_path).expect("block devices.toml");
+        let failed_save = app
+            .clone()
+            .oneshot(
+                Request::put("/api/skills/miio/config")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"config":{"host":"10.0.0.99"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_save.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let guard = devices_arc.read().unwrap();
+            assert_eq!(
+                guard.skills["miio"]
+                    .config
+                    .get("host")
+                    .and_then(|v| v.as_str()),
+                Some("192.168.1.42")
+            );
+        }
+    }
 }

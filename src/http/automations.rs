@@ -169,6 +169,16 @@ pub async fn create_automation(
     }
 
     let dest = engine.automations_dir().join(format!("{}.toml", parsed.id));
+    if dest.exists() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "automation_file_exists",
+            Some(format!(
+                "file '{}.toml' already exists for another automation",
+                parsed.id
+            )),
+        );
+    }
     if let Err(err) = atomic_write(&dest, &req.raw_toml, false) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -199,6 +209,10 @@ pub async fn update_automation(
             "automations_unavailable",
             None,
         );
+    };
+
+    let Some(dest) = engine.get_rule_file(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "not_found", None);
     };
 
     let parsed: AutomationConfig = match toml::from_str(&req.raw_toml) {
@@ -242,9 +256,6 @@ pub async fn update_automation(
         }
     };
 
-    let dest = engine
-        .get_rule_file(&id)
-        .unwrap_or_else(|| engine.automations_dir().join(format!("{id}.toml")));
     if let Err(err) = atomic_write(&dest, &req.raw_toml, false) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,

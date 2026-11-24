@@ -31,7 +31,7 @@ pub struct SkillApiSummary {
 #[derive(Debug, Deserialize)]
 pub struct UpdateSkillConfigRequest {
     #[serde(default)]
-    pub config: Map<String, Value>,
+    pub config: Option<Map<String, Value>>,
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
     #[serde(default)]
@@ -172,59 +172,79 @@ pub async fn update_skill_config(
     Path(skill_id): Path<String>,
     Json(req): Json<UpdateSkillConfigRequest>,
 ) -> Response {
-    let mut toml_map = BTreeMap::new();
-    for (k, v) in &req.config {
-        match serde_json::from_value::<toml::Value>(v.clone()) {
-            Ok(tv) => {
-                toml_map.insert(k.clone(), tv);
+    let parsed_config = match &req.config {
+        Some(cfg) => {
+            let mut toml_map = BTreeMap::new();
+            for (k, v) in cfg {
+                match serde_json::from_value::<toml::Value>(v.clone()) {
+                    Ok(tv) => {
+                        toml_map.insert(k.clone(), tv);
+                    }
+                    Err(err) => {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            "validation_error",
+                            Some(format!("invalid config value for '{k}': {err}")),
+                        );
+                    }
+                }
             }
-            Err(err) => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "validation_error",
-                    Some(format!("invalid config value for '{k}': {err}")),
-                );
-            }
+            Some(toml_map)
         }
-    }
+        None => None,
+    };
 
-    // Persist non-secret config to config/devices.toml
-    {
+    // Persist non-secret config to config/devices.toml using clone-save-commit so failed writes
+    // never leave dirty in-memory state.
+    let (prev_devices, effective_config_json) = {
         let mut devices = state.devices.write().expect("devices rwlock poisoned");
-        let entry = devices
+        let prev = devices.clone();
+        let mut candidate = prev.clone();
+        let entry = candidate
             .skills
             .entry(skill_id.clone())
             .or_insert_with(SkillUserConfig::default);
         if let Some(en) = req.enabled {
             entry.enabled = en;
         }
-        entry.config = toml_map;
-        if let Err(err) = state.config_store.save_devices(&devices) {
+        if let Some(toml_map) = parsed_config {
+            entry.config = toml_map;
+        }
+        let effective_json = toml_config_to_json(&entry.config);
+        if let Err(err) = state.config_store.save_devices(&candidate) {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 Some(err.to_string()),
             );
         }
-    }
+        *devices = candidate;
+        (prev, effective_json)
+    };
 
-    // Persist write-only secrets to 0600 config/secrets.toml and hot-update SkillBridge
+    // Persist write-only secrets to 0600 config/secrets.toml using clone-save-commit and
+    // hot-update SkillBridge; roll back devices if saving secrets fails.
     if !req.secrets.is_empty() {
         let updated_secrets = {
             let mut secrets = state.secrets.write().expect("secrets rwlock poisoned");
+            let mut candidate = secrets.clone();
             for (k, v) in req.secrets {
                 if !v.is_empty() {
-                    secrets.set(k, v);
+                    candidate.set(k, v);
                 }
             }
-            if let Err(err) = state.config_store.save_secrets(&secrets) {
+            if let Err(err) = state.config_store.save_secrets(&candidate) {
+                let mut devices = state.devices.write().expect("devices rwlock poisoned");
+                let _ = state.config_store.save_devices(&prev_devices);
+                *devices = prev_devices;
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     Some(err.to_string()),
                 );
             }
-            secrets.clone()
+            *secrets = candidate.clone();
+            candidate
         };
         if let Some(bridge) = &state.skills {
             bridge.update_secrets(updated_secrets);
@@ -241,7 +261,10 @@ pub async fn update_skill_config(
                 && s.mode == SkillMode::Device
                 && s.status == SkillStatus::Running
         })
-        && bridge.start_skill(&skill_id, req.config).await.is_ok()
+        && bridge
+            .start_skill(&skill_id, effective_config_json)
+            .await
+            .is_ok()
     {
         reloaded = true;
     }
