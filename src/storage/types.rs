@@ -107,6 +107,9 @@ pub enum EntityHistorySeries {
 pub enum AutomationOutcome {
     Succeeded,
     Skipped,
+    ConditionsNotMet,
+    Cancelled,
+    SkippedSingle,
     Failed,
 }
 
@@ -115,6 +118,9 @@ impl AutomationOutcome {
         match self {
             Self::Succeeded => "succeeded",
             Self::Skipped => "skipped",
+            Self::ConditionsNotMet => "conditions_not_met",
+            Self::Cancelled => "cancelled",
+            Self::SkippedSingle => "skipped_single",
             Self::Failed => "failed",
         }
     }
@@ -133,6 +139,9 @@ impl FromStr for AutomationOutcome {
         match s {
             "succeeded" => Ok(Self::Succeeded),
             "skipped" => Ok(Self::Skipped),
+            "conditions_not_met" => Ok(Self::ConditionsNotMet),
+            "cancelled" => Ok(Self::Cancelled),
+            "skipped_single" => Ok(Self::SkippedSingle),
             "failed" => Ok(Self::Failed),
             other => Err(StorageError::Query(format!(
                 "unknown automation outcome '{other}'"
