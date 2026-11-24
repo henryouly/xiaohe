@@ -1,6 +1,6 @@
 # CLI & Configuration
 
-CLI & Configuration covers the unified `xiaohe` binary's subcommands (`core`, `supervisor`, `--help`), unprefixed environment overrides (`CONFIG_DIR`, `HOST`, `PORT`, `SQLITE_PATH`, `RUNTIME_SOCKET`, `SKILLS_DIR`), and fail-fast exit behavior on malformed TOML.
+CLI & Configuration covers the unified `xiaohe` binary's subcommands (`core`, `supervisor`, `--help`), unprefixed environment overrides (`CONFIG_DIR`, `HOST`, `PORT`, `STORAGE_BACKEND`, `SQLITE_PATH`, `RUNTIME_SOCKET`, `SKILLS_DIR`), and fail-fast exit behavior on malformed TOML.
 
 ## Sub-features
 
