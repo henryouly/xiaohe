@@ -1,0 +1,9 @@
+[project]
+name = "xiaohe-skill-miio-airpurifier"
+version = "0.1.0"
+description = "Xiaohe reference Device Skill for Xiaomi Air Purifier"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+miio = ["python-miio>=0.5.12"]

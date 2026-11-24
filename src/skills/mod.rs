@@ -1137,4 +1137,133 @@ for raw in sys.stdin:
         bridge.shutdown().await;
         hist_handle.await.expect("history writer shutdown");
     }
+
+    #[tokio::test]
+    async fn reference_skills_miio_demo_and_climate_optimizer_end_to_end() {
+        let repo_skills = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("ref-rpc.sock");
+
+        let (sup_events_tx, sup_events_rx) = mpsc::unbounded_channel();
+        let mut sup_mgr =
+            SupervisorManager::with_timing(&repo_skills, sup_events_tx, fast_timing());
+        let scan_errs = sup_mgr.scan();
+        assert!(
+            scan_errs.is_empty(),
+            "reference skills manifests must validate cleanly: {scan_errs:?}"
+        );
+
+        let sup_mgr = Arc::new(AsyncMutex::new(sup_mgr));
+        let (sup_shutdown_tx, sup_shutdown_rx) = watch::channel(false);
+        let sock_clone = sock_path.clone();
+        let sup_handle = tokio::spawn(async move {
+            run_uds_server(&sock_clone, sup_mgr, sup_events_rx, sup_shutdown_rx)
+                .await
+                .expect("uds server");
+        });
+
+        for _ in 0..40 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(sock_path.exists());
+
+        let bus = EventBus::new();
+        let state = StateStore::new(bus.clone());
+        let (core_shutdown_tx, core_shutdown_rx) = watch::channel(false);
+
+        let mut purifier_cfg = BTreeMap::new();
+        purifier_cfg.insert("demo_mode".into(), toml::Value::Boolean(true));
+        purifier_cfg.insert("poll_interval_secs".into(), toml::Value::Integer(1));
+        let mut skill_configs = BTreeMap::new();
+        skill_configs.insert(
+            "miio-airpurifier".to_owned(),
+            SkillUserConfig {
+                enabled: true,
+                config: purifier_cfg,
+            },
+        );
+
+        let bridge = SkillBridge::start(
+            &sock_path,
+            skill_configs,
+            SecretsConfig::default(),
+            state.clone(),
+            bus,
+            core_shutdown_rx,
+        );
+
+        // Wait for uv sync + miio-airpurifier startup + first poll
+        let mut ready = false;
+        for _ in 0..120 {
+            if bridge.is_connected()
+                && state
+                    .get("sensor.purifier_temp")
+                    .is_some_and(|e| e.availability == Availability::Online)
+                && state
+                    .get("sensor.purifier_humidity")
+                    .is_some_and(|e| e.availability == Availability::Online)
+                && state
+                    .get("switch.purifier_power")
+                    .is_some_and(|e| e.state == DomainState::Switch { on: false })
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready,
+            "expected miio-airpurifier demo_mode to publish temp, humidity, and power switch"
+        );
+
+        // Invoke climate-optimizer action skill with threshold_c = 24.0 so it triggers switch.purifier_power
+        let mut invoke_params = Map::new();
+        invoke_params.insert("temp_entity".into(), json!("sensor.purifier_temp"));
+        invoke_params.insert("humidity_entity".into(), json!("sensor.purifier_humidity"));
+        invoke_params.insert("target_switch".into(), json!("switch.purifier_power"));
+        invoke_params.insert("threshold_c".into(), json!(24.0));
+
+        let res = bridge
+            .invoke_skill(
+                "climate-optimizer",
+                Map::new(),
+                SkillInvokeParams {
+                    action: "evaluate_comfort".into(),
+                    params: invoke_params,
+                    context: Map::new(),
+                },
+            )
+            .await
+            .expect("invoke climate-optimizer");
+
+        assert_eq!(res["temperature_c"], 24.5);
+        assert_eq!(res["humidity_pct"], 52.0);
+        assert_eq!(res["triggered_switch"], "switch.purifier_power");
+        assert!(res["heat_index_c"].as_f64().unwrap() >= 24.0);
+
+        // Confirm switch.purifier_power is now ON in StateStore
+        let mut turned_on = false;
+        for _ in 0..30 {
+            if state
+                .get("switch.purifier_power")
+                .is_some_and(|e| e.state == DomainState::Switch { on: true })
+            {
+                turned_on = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            turned_on,
+            "climate-optimizer core.call_entity should have turned on switch.purifier_power"
+        );
+
+        let _ = core_shutdown_tx.send(true);
+        bridge.shutdown().await;
+        let _ = sup_shutdown_tx.send(true);
+        sup_handle.await.expect("supervisor shutdown");
+    }
 }

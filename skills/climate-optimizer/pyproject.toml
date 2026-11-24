@@ -1,0 +1,6 @@
+[project]
+name = "xiaohe-skill-climate-optimizer"
+version = "0.1.0"
+description = "Xiaohe reference Action Skill for indoor thermal comfort evaluation"
+requires-python = ">=3.11"
+dependencies = []

@@ -33,6 +33,9 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run Python SDK tests
+        run: python3 -m unittest discover -s sdk/python/tests -v
+
   web:
     name: Web (tsc, vite build)
     runs-on: ubuntu-latest

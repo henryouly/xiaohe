@@ -14,9 +14,11 @@ data/
 *.db-shm
 config/secrets.toml
 
-# Python / uv caches in local skills
+# Python / uv caches in local skills & SDK
 skills/**/.venv/
 skills/**/__pycache__/
+sdk/**/.venv/
+sdk/**/__pycache__/
 
 # OS / editor files
 .DS_Store

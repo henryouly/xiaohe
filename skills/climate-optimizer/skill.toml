@@ -1,0 +1,36 @@
+[skill]
+id = "climate-optimizer"
+name = "Climate Comfort Optimizer"
+version = "0.1.0"
+mode = "action"
+description = "On-demand Action Skill that computes indoor heat index from Core sensor entities and optionally triggers a cooling/purifier switch"
+
+[runtime]
+type = "python-uv"
+python = ">=3.11"
+entrypoint = ["python", "src/main.py"]
+invoke_timeout_secs = 15
+
+[actions.evaluate_comfort]
+description = "Compute apparent temperature (heat index) and comfort rating from temperature and humidity sensors, optionally triggering target_switch when above threshold"
+
+[actions.evaluate_comfort.params.temp_entity]
+type = "string"
+required = true
+description = "Entity ID of temperature sensor (°C)"
+
+[actions.evaluate_comfort.params.humidity_entity]
+type = "string"
+required = true
+description = "Entity ID of relative humidity sensor (%)"
+
+[actions.evaluate_comfort.params.target_switch]
+type = "string"
+required = false
+description = "Optional switch entity_id to turn_on when heat_index_c exceeds threshold_c"
+
+[actions.evaluate_comfort.params.threshold_c]
+type = "number"
+required = false
+default = 27.0
+description = "Apparent temperature threshold in °C for recommending/triggering cooling"
