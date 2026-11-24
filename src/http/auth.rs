@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthError, AuthenticatedUser, SESSION_COOKIE_NAME, UserSummary};
+use crate::auth::{AuthCredential, AuthError, AuthenticatedUser, SESSION_COOKIE_NAME, UserSummary};
 use crate::http::AppState;
 
 /// Shared JSON error response helper for HTTP API endpoints.
@@ -61,8 +61,29 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        resolve_user_from_headers(&parts.headers, state)
-            .map(AuthUser)
+        resolve_credential_from_headers(&parts.headers, state)
+            .map(|(user, _)| AuthUser(user))
+            .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "unauthorized", None))
+    }
+}
+
+/// Axum extractor providing both the authenticated user and the underlying credential
+/// for live re-validation on long-lived streams (SSE).
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub user: AuthenticatedUser,
+    pub credential: AuthCredential,
+}
+
+impl FromRequestParts<AppState> for AuthContext {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        resolve_credential_from_headers(&parts.headers, state)
+            .map(|(user, credential)| AuthContext { user, credential })
             .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "unauthorized", None))
     }
 }
@@ -97,14 +118,16 @@ impl FromRequestParts<AppState> for OptionalAuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(OptionalAuthUser(resolve_user_from_headers(
-            &parts.headers,
-            state,
-        )))
+        Ok(OptionalAuthUser(
+            resolve_credential_from_headers(&parts.headers, state).map(|(u, _)| u),
+        ))
     }
 }
 
-fn resolve_user_from_headers(headers: &HeaderMap, state: &AppState) -> Option<AuthenticatedUser> {
+fn resolve_credential_from_headers(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<(AuthenticatedUser, AuthCredential)> {
     // 1. Prefer Authorization: Bearer <token>
     if let Some(auth_val) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())
         && let Some((scheme, token)) = auth_val.trim().split_once(char::is_whitespace)
@@ -112,13 +135,19 @@ fn resolve_user_from_headers(headers: &HeaderMap, state: &AppState) -> Option<Au
     {
         let token = token.trim();
         if !token.is_empty() {
-            return state.auth.authenticate_bearer(token);
+            return state
+                .auth
+                .authenticate_bearer(token)
+                .map(|u| (u, AuthCredential::Bearer(token.to_owned())));
         }
     }
 
     // 2. Fall back to HttpOnly session cookie `xiaohe_session`
     if let Some(sid) = extract_session_cookie(headers) {
-        return state.auth.authenticate_session(&sid);
+        return state
+            .auth
+            .authenticate_session(&sid)
+            .map(|u| (u, AuthCredential::Session(sid)));
     }
 
     None

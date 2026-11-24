@@ -113,6 +113,14 @@ pub struct UpdateUserInput {
     pub allow_guest_locks: Option<bool>,
 }
 
+/// Credential presented by an authenticated caller, used to re-validate live RBAC
+/// permissions and revocation on long-lived streams such as SSE (`GET /api/events`).
+#[derive(Debug, Clone)]
+pub enum AuthCredential {
+    Session(String),
+    Bearer(String),
+}
+
 /// Authenticated caller context extracted by Axum middleware/extractors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedUser {
@@ -244,7 +252,7 @@ impl AuthService {
             password_hash,
             role: UserRole::Admin,
             allowed_areas: AllowedAreas::All,
-            allow_guest_locks: true,
+            allow_guest_locks: false,
             api_tokens: Vec::new(),
         };
 
@@ -253,8 +261,10 @@ impl AuthService {
             if guard.users.iter().any(|u| u.role == UserRole::Admin) {
                 return Err(AuthError::AlreadyInitialized);
             }
-            guard.users.push(user.clone());
-            self.inner.config_store.save_users(&guard)?;
+            let mut candidate = guard.clone();
+            candidate.users.push(user.clone());
+            self.inner.config_store.save_users(&candidate)?;
+            *guard = candidate;
         }
 
         let sid = self.create_session(&user.id);
@@ -281,8 +291,29 @@ impl AuthService {
             return Err(AuthError::InvalidCredentials);
         }
 
-        let sid = self.create_session(&user.id);
-        Ok((UserSummary::from(&user), sid))
+        // Re-check under the users read lock that the account still exists with the exact
+        // password hash we verified, and insert the session before releasing the lock.
+        // Because update_user/delete_user hold the users write lock while revoking sessions,
+        // an in-flight login using an old password can never mint a surviving session.
+        let guard = self.inner.users.read().expect("users rwlock poisoned");
+        let current = guard
+            .users
+            .iter()
+            .find(|u| u.id == user.id)
+            .ok_or(AuthError::InvalidCredentials)?;
+        if current.password_hash != user.password_hash {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let sid = self.create_session(&current.id);
+        Ok((UserSummary::from(current), sid))
+    }
+
+    /// Re-validate a previously extracted credential against current sessions, tokens, and RBAC state.
+    pub fn revalidate(&self, credential: &AuthCredential) -> Option<AuthenticatedUser> {
+        match credential {
+            AuthCredential::Session(sid) => self.authenticate_session(sid),
+            AuthCredential::Bearer(token) => self.authenticate_bearer(token),
+        }
     }
 
     /// Revoke an active session cookie token.
@@ -397,8 +428,10 @@ impl AuthService {
         {
             return Err(AuthError::UserExists(username));
         }
-        guard.users.push(user.clone());
-        self.inner.config_store.save_users(&guard)?;
+        let mut candidate = guard.clone();
+        candidate.users.push(user.clone());
+        self.inner.config_store.save_users(&candidate)?;
+        *guard = candidate;
         Ok(UserSummary::from(&user))
     }
 
@@ -415,81 +448,84 @@ impl AuthService {
             None => None,
         };
 
-        let mut invalidate_sessions = false;
-        let updated = {
-            let mut guard = self.inner.users.write().expect("users rwlock poisoned");
-            let admin_count = guard
-                .users
-                .iter()
-                .filter(|u| u.role == UserRole::Admin)
-                .count();
-            let user = guard
-                .users
-                .iter_mut()
-                .find(|u| u.id == user_id)
-                .ok_or_else(|| AuthError::UserNotFound(user_id.to_owned()))?;
+        let mut guard = self.inner.users.write().expect("users rwlock poisoned");
+        let mut candidate = guard.clone();
+        let admin_count = candidate
+            .users
+            .iter()
+            .filter(|u| u.role == UserRole::Admin)
+            .count();
+        let user = candidate
+            .users
+            .iter_mut()
+            .find(|u| u.id == user_id)
+            .ok_or_else(|| AuthError::UserNotFound(user_id.to_owned()))?;
 
-            if let Some(new_role) = input.role {
-                if user.role == UserRole::Admin && new_role != UserRole::Admin && admin_count <= 1 {
-                    return Err(AuthError::LastAdminProtected);
+        let mut invalidate_sessions = false;
+        if let Some(new_role) = input.role {
+            if user.role == UserRole::Admin && new_role != UserRole::Admin && admin_count <= 1 {
+                return Err(AuthError::LastAdminProtected);
+            }
+            if user.role != new_role {
+                let was_guest = user.role == UserRole::Guest;
+                user.role = new_role;
+                if !was_guest && new_role == UserRole::Guest && input.allow_guest_locks.is_none() {
+                    user.allow_guest_locks = false;
                 }
-                if user.role != new_role {
-                    user.role = new_role;
-                    invalidate_sessions = true;
-                }
-            }
-            if let Some(name) = input.display_name {
-                let trimmed = name.trim();
-                if !trimmed.is_empty() {
-                    user.display_name = trimmed.to_owned();
-                }
-            }
-            if let Some(areas) = input.allowed_areas {
-                user.allowed_areas = if user.role == UserRole::Admin {
-                    AllowedAreas::All
-                } else {
-                    areas
-                };
-            }
-            if let Some(allow_locks) = input.allow_guest_locks {
-                user.allow_guest_locks = allow_locks;
-            }
-            if let Some(hash) = new_hash {
-                user.password_hash = hash;
                 invalidate_sessions = true;
             }
+        }
+        if let Some(name) = input.display_name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                user.display_name = trimmed.to_owned();
+            }
+        }
+        if let Some(areas) = input.allowed_areas {
+            user.allowed_areas = if user.role == UserRole::Admin {
+                AllowedAreas::All
+            } else {
+                areas
+            };
+        }
+        if let Some(allow_locks) = input.allow_guest_locks {
+            user.allow_guest_locks = allow_locks;
+        }
+        if let Some(hash) = new_hash {
+            user.password_hash = hash;
+            invalidate_sessions = true;
+        }
 
-            let summary = UserSummary::from(&*user);
-            self.inner.config_store.save_users(&guard)?;
-            summary
-        };
+        let summary = UserSummary::from(&*user);
+        self.inner.config_store.save_users(&candidate)?;
+        *guard = candidate;
 
         if invalidate_sessions {
             self.revoke_user_sessions(user_id);
         }
-        Ok(updated)
+        Ok(summary)
     }
 
     pub fn delete_user(&self, user_id: &str) -> Result<(), AuthError> {
-        {
-            let mut guard = self.inner.users.write().expect("users rwlock poisoned");
-            let idx = guard
-                .users
-                .iter()
-                .position(|u| u.id == user_id)
-                .ok_or_else(|| AuthError::UserNotFound(user_id.to_owned()))?;
-            let is_admin = guard.users[idx].role == UserRole::Admin;
-            let admin_count = guard
-                .users
-                .iter()
-                .filter(|u| u.role == UserRole::Admin)
-                .count();
-            if is_admin && admin_count <= 1 {
-                return Err(AuthError::LastAdminProtected);
-            }
-            guard.users.remove(idx);
-            self.inner.config_store.save_users(&guard)?;
+        let mut guard = self.inner.users.write().expect("users rwlock poisoned");
+        let mut candidate = guard.clone();
+        let idx = candidate
+            .users
+            .iter()
+            .position(|u| u.id == user_id)
+            .ok_or_else(|| AuthError::UserNotFound(user_id.to_owned()))?;
+        let is_admin = candidate.users[idx].role == UserRole::Admin;
+        let admin_count = candidate
+            .users
+            .iter()
+            .filter(|u| u.role == UserRole::Admin)
+            .count();
+        if is_admin && admin_count <= 1 {
+            return Err(AuthError::LastAdminProtected);
         }
+        candidate.users.remove(idx);
+        self.inner.config_store.save_users(&candidate)?;
+        *guard = candidate;
         self.revoke_user_sessions(user_id);
         Ok(())
     }
@@ -509,7 +545,8 @@ impl AuthService {
 
         {
             let mut guard = self.inner.users.write().expect("users rwlock poisoned");
-            let user = guard
+            let mut candidate = guard.clone();
+            let user = candidate
                 .users
                 .iter_mut()
                 .find(|u| u.id == user_id)
@@ -520,7 +557,8 @@ impl AuthService {
                 token_hash,
                 created_at,
             });
-            self.inner.config_store.save_users(&guard)?;
+            self.inner.config_store.save_users(&candidate)?;
+            *guard = candidate;
         }
 
         Ok(MintedApiToken {
@@ -533,7 +571,8 @@ impl AuthService {
 
     pub fn revoke_token(&self, user_id: &str, token_id: &str) -> Result<(), AuthError> {
         let mut guard = self.inner.users.write().expect("users rwlock poisoned");
-        let user = guard
+        let mut candidate = guard.clone();
+        let user = candidate
             .users
             .iter_mut()
             .find(|u| u.id == user_id)
@@ -543,7 +582,8 @@ impl AuthService {
         if user.api_tokens.len() == before {
             return Err(AuthError::TokenNotFound(token_id.to_owned()));
         }
-        self.inner.config_store.save_users(&guard)?;
+        self.inner.config_store.save_users(&candidate)?;
+        *guard = candidate;
         Ok(())
     }
 
