@@ -3,13 +3,10 @@ import { Show, type Component, type ParentComponent } from "solid-js";
 import { AppShell } from "./components/AppShell";
 import { AuthGate } from "./components/AuthGate";
 import { useXiaohe, XiaoheProvider } from "./lib/store";
-
-const PlaceholderView: Component<{ title: string; subtitle: string }> = (props) => (
-  <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
-    <h1 class="text-xl font-semibold text-white">{props.title}</h1>
-    <p class="mt-1 text-sm text-slate-400">{props.subtitle}</p>
-  </div>
-);
+import { AutomationsView } from "./views/AutomationsView";
+import { DashboardView } from "./views/DashboardView";
+import { HistoryView } from "./views/HistoryView";
+import { SkillsView } from "./views/SkillsView";
 
 const AdminOnly: ParentComponent = (props) => {
   const store = useXiaohe();
@@ -42,32 +39,13 @@ export const App: Component = () => {
   return (
     <XiaoheProvider>
       <Router root={ProtectedShell}>
-        <Route
-          path="/"
-          component={() => (
-            <PlaceholderView
-              title="Area Control Dashboard"
-              subtitle="Phase 6.2 view coming next."
-            />
-          )}
-        />
-        <Route
-          path="/history"
-          component={() => (
-            <PlaceholderView
-              title="History & Timeline"
-              subtitle="Phase 6.2 view coming next."
-            />
-          )}
-        />
+        <Route path="/" component={DashboardView} />
+        <Route path="/history" component={HistoryView} />
         <Route
           path="/skills"
           component={() => (
             <AdminOnly>
-              <PlaceholderView
-                title="Skill Manager"
-                subtitle="Phase 6.2 view coming next."
-              />
+              <SkillsView />
             </AdminOnly>
           )}
         />
@@ -75,10 +53,7 @@ export const App: Component = () => {
           path="/automations"
           component={() => (
             <AdminOnly>
-              <PlaceholderView
-                title="Automations & Run Logs"
-                subtitle="Phase 6.2 view coming next."
-              />
+              <AutomationsView />
             </AdminOnly>
           )}
         />
