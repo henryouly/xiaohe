@@ -14,9 +14,10 @@ export function mergeEntitiesSnapshot(
   for (const incoming of snapshot) {
     const existing = current[incoming.entity_id];
     if (existing && existing.last_updated_at >= incoming.last_updated_at) {
-      // Preserve newer local SSE state while refreshing static metadata if needed.
+      // Preserve newer local SSE state (including area_id) while refreshing static metadata.
       next[incoming.entity_id] = {
         ...incoming,
+        area_id: existing.area_id,
         availability: existing.availability,
         state: existing.state,
         extra: existing.extra,
@@ -43,7 +44,10 @@ export function applyEntityStateEvent(
   }
   return {
     ...existing,
-    area_id: event.area_id ?? existing.area_id,
+    area_id:
+      event.area_id === undefined
+        ? existing.area_id
+        : (event.area_id ?? undefined),
     availability: event.availability ?? existing.availability,
     state: event.state ?? existing.state,
     extra: event.extra ?? existing.extra,

@@ -164,11 +164,14 @@ pub fn build_router_with_spa(state: AppState, web_dist_dir: Option<PathBuf>) -> 
         .merge(webhook_route)
         // Ensure unknown /api/* routes return JSON 404 rather than SPA index.html
         .route("/api", any(api_not_found))
+        .route("/api/", any(api_not_found))
         .route("/api/{*rest}", any(api_not_found));
 
     if let Some(dist_dir) = web_dist_dir {
         let index_html = dist_dir.join("index.html");
         if index_html.is_file() {
+            // Serve /assets strictly without index.html fallback so missing hashed chunks return 404.
+            router = router.nest_service("/assets", ServeDir::new(dist_dir.join("assets")));
             let spa_service = ServeDir::new(&dist_dir).fallback(ServeFile::new(index_html));
             router = router.fallback_service(spa_service);
         }
@@ -1830,17 +1833,29 @@ action = "turn_on"
         .unwrap();
         assert_eq!(asset_body, "console.log('ok');");
 
-        // 4. Unknown /api/* returns JSON 404, NOT index.html
-        let api_missing = app
+        // 4. Unknown /api/* (and /api/ trailing slash) returns JSON 404, NOT index.html
+        for req in [
+            Request::get("/api/does_not_exist")
+                .body(Body::empty())
+                .unwrap(),
+            Request::get("/api/").body(Body::empty()).unwrap(),
+            Request::post("/api/").body(Body::empty()).unwrap(),
+        ] {
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(json_body(resp).await["error"], "not_found");
+        }
+
+        // 5. Missing static asset under /assets/* returns 404, NOT 200 text/html index.html
+        let missing_asset = app
             .clone()
             .oneshot(
-                Request::get("/api/does_not_exist")
+                Request::get("/assets/nonexistent.js")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(api_missing.status(), StatusCode::NOT_FOUND);
-        assert_eq!(json_body(api_missing).await["error"], "not_found");
+        assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
     }
 }
