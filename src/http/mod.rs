@@ -208,17 +208,28 @@ mod tests {
         let state = StateStore::new(events.clone());
 
         let secret = "my-super-secret-webhook-token";
+        // Independently computed via `printf '%s' 'my-super-secret-webhook-token' | sha256sum`.
+        let expected_hex = "bddbaa946a00f5f1c2add380d6eac35745b05f011dfd408f619d43c48ec1a97b";
+        let expected_hash = format!("sha256:{expected_hex}");
+        assert_eq!(hash_webhook_secret(secret), expected_hash);
+
         let webhooks = Arc::new(vec![
             WebhookConfig {
                 id: "ios_arriving".into(),
                 name: Some("iOS Shortcuts".into()),
-                secret_hash: hash_webhook_secret(secret),
+                secret_hash: expected_hash,
+                enabled: true,
+            },
+            WebhookConfig {
+                id: "raw_hex_hook".into(),
+                name: None,
+                secret_hash: expected_hex.to_ascii_uppercase(),
                 enabled: true,
             },
             WebhookConfig {
                 id: "disabled_hook".into(),
                 name: None,
-                secret_hash: hash_webhook_secret(secret),
+                secret_hash: format!("sha256:{expected_hex}"),
                 enabled: false,
             },
         ]);
@@ -284,6 +295,17 @@ mod tests {
             }
             other => panic!("expected WebhookReceived, got {other:?}"),
         }
+
+        // 2b. Raw uppercase 64-hex secret_hash without `sha256:` prefix -> 202
+        let req2b = Request::post("/api/webhooks/raw_hex_hook")
+            .header("x-webhook-secret", secret)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req2b).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        let _ = rx.recv().await.expect("webhook event 2b");
 
         // 3. Invalid secret -> 401
         let bad_auth = Request::post("/api/webhooks/ios_arriving")

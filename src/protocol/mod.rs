@@ -18,61 +18,121 @@ mod tests {
     use super::skill::{RestartPolicy, RuntimeType, SkillMode, SkillStatus};
 
     #[test]
-    fn domain_state_variants_round_trip() {
-        let variants = vec![
-            DomainState::Light {
-                on: true,
-                brightness: Some(80),
-                color_temp_k: Some(3200),
-                rgb: Some([255, 200, 150]),
-            },
-            DomainState::Switch { on: false },
-            DomainState::Climate {
-                mode: ClimateMode::Cool,
-                target_temp_c: Some(23.5),
-                current_temp_c: Some(25.0),
-                fan_mode: Some("auto".into()),
-            },
-            DomainState::Sensor {
-                value: SensorValue::Number(14.0),
-                unit: Some("µg/m³".into()),
-                device_class: Some("pm25".into()),
-            },
-            DomainState::Sensor {
-                value: SensorValue::Text("good".into()),
-                unit: None,
-                device_class: None,
-            },
-            DomainState::BinarySensor {
-                active: true,
-                device_class: Some("motion".into()),
-            },
-            DomainState::Cover {
-                state: CoverState::Open,
-                position: Some(100),
-            },
-            DomainState::Lock {
-                state: LockState::Locked,
-            },
-            DomainState::MediaPlayer {
-                state: MediaState::Playing,
-                volume: Some(45),
-                muted: Some(false),
-                title: Some("Track 1".into()),
-            },
-            DomainState::Button {
-                last_pressed_at: Some(1_700_000_000_000),
-            },
-            DomainState::Custom {
-                state: "favorite".into(),
-            },
+    fn domain_state_variants_match_documented_wire_json() {
+        let cases: Vec<(DomainState, serde_json::Value)> = vec![
+            (
+                DomainState::Light {
+                    on: true,
+                    brightness: Some(80),
+                    color_temp_k: Some(3200),
+                    rgb: Some([255, 200, 150]),
+                },
+                json!({
+                    "domain": "light",
+                    "on": true,
+                    "brightness": 80,
+                    "color_temp_k": 3200,
+                    "rgb": [255, 200, 150]
+                }),
+            ),
+            (
+                DomainState::Switch { on: false },
+                json!({ "domain": "switch", "on": false }),
+            ),
+            (
+                DomainState::Climate {
+                    mode: ClimateMode::FanOnly,
+                    target_temp_c: Some(23.5),
+                    current_temp_c: None,
+                    fan_mode: Some("auto".into()),
+                },
+                json!({
+                    "domain": "climate",
+                    "mode": "fan_only",
+                    "target_temp_c": 23.5,
+                    "fan_mode": "auto"
+                }),
+            ),
+            (
+                DomainState::Sensor {
+                    value: SensorValue::Number(14.0),
+                    unit: Some("µg/m³".into()),
+                    device_class: Some("pm25".into()),
+                },
+                json!({
+                    "domain": "sensor",
+                    "value": 14.0,
+                    "unit": "µg/m³",
+                    "device_class": "pm25"
+                }),
+            ),
+            (
+                DomainState::Sensor {
+                    value: SensorValue::Text("good".into()),
+                    unit: None,
+                    device_class: None,
+                },
+                json!({ "domain": "sensor", "value": "good" }),
+            ),
+            (
+                DomainState::BinarySensor {
+                    active: true,
+                    device_class: Some("motion".into()),
+                },
+                json!({
+                    "domain": "binary_sensor",
+                    "active": true,
+                    "device_class": "motion"
+                }),
+            ),
+            (
+                DomainState::Cover {
+                    state: CoverState::Opening,
+                    position: Some(50),
+                },
+                json!({ "domain": "cover", "state": "opening", "position": 50 }),
+            ),
+            (
+                DomainState::Lock {
+                    state: LockState::Locked,
+                },
+                json!({ "domain": "lock", "state": "locked" }),
+            ),
+            (
+                DomainState::MediaPlayer {
+                    state: MediaState::Playing,
+                    volume: Some(45),
+                    muted: Some(false),
+                    title: Some("Track 1".into()),
+                },
+                json!({
+                    "domain": "media_player",
+                    "state": "playing",
+                    "volume": 45,
+                    "muted": false,
+                    "title": "Track 1"
+                }),
+            ),
+            (
+                DomainState::Button {
+                    last_pressed_at: Some(1_700_000_000_000),
+                },
+                json!({ "domain": "button", "last_pressed_at": 1_700_000_000_000_i64 }),
+            ),
+            (
+                DomainState::Custom {
+                    state: "favorite".into(),
+                },
+                json!({ "domain": "custom", "state": "favorite" }),
+            ),
         ];
 
-        for variant in variants {
-            let serialized = serde_json::to_string(&variant).expect("serialize DomainState");
-            let deserialized: DomainState =
-                serde_json::from_str(&serialized).expect("deserialize DomainState");
-            assert_eq!(variant, deserialized);
+        for (variant, expected_json) in cases {
+            let actual_json = serde_json::to_value(&variant).expect("serialize DomainState");
+            assert_eq!(actual_json, expected_json);
+            let parsed: DomainState =
+                serde_json::from_value(expected_json).expect("deserialize DomainState");
+            assert_eq!(parsed, variant);
         }
     }
 

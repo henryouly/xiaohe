@@ -398,6 +398,15 @@ mod tests {
             ],
         };
         store.save_users(&users).expect("save users");
+        let users_toml = fs::read_to_string(dir.path().join(USERS_FILE)).expect("read users.toml");
+        assert!(
+            users_toml.contains(r#"allowed_areas = "*""#),
+            "expected wildcard allowed_areas in TOML, got:\n{users_toml}"
+        );
+        assert!(
+            users_toml.contains(r#"allowed_areas = ["living_room"]"#),
+            "expected list allowed_areas in TOML, got:\n{users_toml}"
+        );
         assert_eq!(store.load_users().expect("load users"), users);
 
         // 4. devices.toml
