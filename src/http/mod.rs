@@ -1,15 +1,18 @@
+pub mod auth;
+pub mod users;
 pub mod webhooks;
 
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
+use crate::auth::AuthService;
 use crate::config::WebhookConfig;
 use crate::http::webhooks::{MAX_WEBHOOK_BODY_BYTES, handle_webhook};
 use crate::skills::SkillBridge;
@@ -23,6 +26,7 @@ pub struct AppState {
     pub events: EventBus,
     pub webhooks: Arc<Vec<WebhookConfig>>,
     pub skills: Option<SkillBridge>,
+    pub auth: AuthService,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,7 +41,7 @@ struct ReadinessResponse {
     runtime: &'static str,
 }
 
-/// Build the `axum` HTTP router with health probes, webhook ingestion, and request tracing.
+/// Build the `axum` HTTP router with health probes, auth/RBAC, user management, and webhooks.
 pub fn build_router(state: AppState) -> Router {
     let webhook_route = Router::new()
         .route("/api/webhooks/{webhook_id}", post(handle_webhook))
@@ -46,6 +50,23 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/health/ready", get(health_ready))
+        .route("/api/auth/bootstrap", post(auth::bootstrap))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
+        .route(
+            "/api/users",
+            get(users::list_users).post(users::create_user),
+        )
+        .route(
+            "/api/users/{user_id}",
+            put(users::update_user).delete(users::delete_user),
+        )
+        .route("/api/users/{user_id}/tokens", post(users::mint_token))
+        .route(
+            "/api/users/{user_id}/tokens/{token_id}",
+            delete(users::revoke_token),
+        )
         .merge(webhook_route)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -157,17 +178,28 @@ mod tests {
         serde_json::from_slice(&bytes).expect("parse json")
     }
 
+    fn test_auth() -> (tempfile::TempDir, AuthService) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let auth = AuthService::new(
+            crate::config::ConfigStore::new(dir.path()),
+            crate::config::UsersConfig::default(),
+        );
+        (dir, auth)
+    }
+
     #[tokio::test]
     async fn health_and_ready_return_200_with_healthy_store() {
         let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
         let events = EventBus::new();
         let state = StateStore::new(events.clone());
+        let (_dir, auth) = test_auth();
         let app = build_router(AppState {
             history: store,
             state,
             events,
             webhooks: Arc::new(vec![]),
             skills: None,
+            auth,
         });
 
         let resp = app
@@ -192,12 +224,14 @@ mod tests {
     async fn health_ready_returns_503_when_storage_fails() {
         let events = EventBus::new();
         let state = StateStore::new(events.clone());
+        let (_dir, auth) = test_auth();
         let app = build_router(AppState {
             history: Arc::new(FailingStore),
             state,
             events,
             webhooks: Arc::new(vec![]),
             skills: None,
+            auth,
         });
 
         let ready = app
@@ -244,12 +278,14 @@ mod tests {
             },
         ]);
 
+        let (_dir, auth) = test_auth();
         let app = build_router(AppState {
             history: store,
             state,
             events,
             webhooks,
             skills: None,
+            auth,
         });
 
         // 1. Bearer auth + JSON body -> 202 + WebhookReceived with auth headers stripped
@@ -366,5 +402,207 @@ mod tests {
             app.oneshot(too_large).await.unwrap().status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[tokio::test]
+    async fn auth_bootstrap_login_tokens_and_rbac_enforcement() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let events = EventBus::new();
+        let state = StateStore::new(events.clone());
+        let (_dir, auth) = test_auth();
+        let app = build_router(AppState {
+            history: store,
+            state,
+            events,
+            webhooks: Arc::new(vec![]),
+            skills: None,
+            auth,
+        });
+
+        // 1. Before bootstrap: /api/auth/me reports initialized=false, user=null
+        let me0 = app
+            .clone()
+            .oneshot(Request::get("/api/auth/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(me0.status(), StatusCode::OK);
+        let me0_body = json_body(me0).await;
+        assert_eq!(me0_body["initialized"], false);
+        assert!(me0_body["user"].is_null());
+
+        // 2. Unauthenticated access to /api/users -> 401
+        let unauth = app
+            .clone()
+            .oneshot(Request::get("/api/users").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Bootstrap first Admin -> 201 + Set-Cookie
+        let boot = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"password123","display_name":"Admin"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boot.status(), StatusCode::CREATED);
+        let cookie_header = boot
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("Set-Cookie present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie_header.contains("xiaohe_session="));
+        assert!(cookie_header.contains("HttpOnly"));
+        let session_cookie = cookie_header.split(';').next().unwrap().to_owned();
+        let boot_body = json_body(boot).await;
+        let admin_id = boot_body["user"]["id"].as_str().unwrap().to_owned();
+
+        // Second bootstrap -> 409 Conflict
+        let boot2 = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin2","password":"password123","display_name":"Admin 2"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boot2.status(), StatusCode::CONFLICT);
+
+        // 4. Admin creates a Member user with restricted allowed_areas
+        let create_member = app
+            .clone()
+            .oneshot(
+                Request::post("/api/users")
+                    .header("cookie", &session_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"alice","display_name":"Alice","password":"password123","role":"member","allowed_areas":["living_room"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_member.status(), StatusCode::CREATED);
+        let member_body = json_body(create_member).await;
+        let member_id = member_body["user"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(member_body["user"]["role"], "member");
+        assert!(member_body["user"].get("password_hash").is_none());
+
+        // 5. Mint Bearer token for Member -> Member calling Admin route /api/users gets 403
+        let mint = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/users/{member_id}/tokens"))
+                    .header("cookie", &session_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"phone"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mint.status(), StatusCode::CREATED);
+        let mint_body = json_body(mint).await;
+        let bearer = mint_body["token"].as_str().unwrap().to_owned();
+        let token_id = mint_body["id"].as_str().unwrap().to_owned();
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                Request::get("/api/users")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        // Member /api/auth/me succeeds with Bearer token
+        let me_member = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me_member.status(), StatusCode::OK);
+        assert_eq!(json_body(me_member).await["user"]["username"], "alice");
+
+        // Revoke token -> Bearer token no longer authenticates
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/users/{member_id}/tokens/{token_id}"))
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+
+        let after_revoke = app
+            .clone()
+            .oneshot(
+                Request::get("/api/users")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_revoke.status(), StatusCode::UNAUTHORIZED);
+
+        // 6. Deleting last remaining admin -> 409 Conflict
+        let del_admin = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/users/{admin_id}"))
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_admin.status(), StatusCode::CONFLICT);
+
+        // 7. Logout invalidates session cookie
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/logout")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+        let after_logout = app
+            .oneshot(
+                Request::get("/api/users")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_logout.status(), StatusCode::UNAUTHORIZED);
     }
 }
