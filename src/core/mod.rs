@@ -205,19 +205,33 @@ mod tests {
     use crate::storage::{HistoryEntryKind, SqliteStore, StateHistoryEntry, TimeRange};
 
     #[tokio::test]
-    async fn retention_pruner_removes_expired_rows_and_shuts_down_cleanly() {
+    async fn retention_pruner_removes_expired_rows_and_preserves_recent_rows() {
         let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let recent_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         store
-            .record_state_batch(&[StateHistoryEntry {
-                entity_id: "sensor.old".into(),
-                ts: 1_000, // epoch + 1s (far older than 1 day)
-                kind: HistoryEntryKind::Numeric {
-                    value: 10.0,
-                    unit: Some("°C".into()),
+            .record_state_batch(&[
+                StateHistoryEntry {
+                    entity_id: "sensor.retention_test".into(),
+                    ts: 1_000, // epoch + 1s (expired)
+                    kind: HistoryEntryKind::Numeric {
+                        value: 10.0,
+                        unit: Some("°C".into()),
+                    },
                 },
-            }])
+                StateHistoryEntry {
+                    entity_id: "sensor.retention_test".into(),
+                    ts: recent_ts, // current time (must NOT be pruned)
+                    kind: HistoryEntryKind::Numeric {
+                        value: 22.5,
+                        unit: Some("°C".into()),
+                    },
+                },
+            ])
             .await
-            .expect("record old sample");
+            .expect("record samples");
 
         let (tx, rx) = watch::channel(false);
         let handle = spawn_retention_pruner(Arc::clone(&store) as Arc<dyn HistoryStore>, 1, rx)
@@ -229,16 +243,20 @@ mod tests {
         handle.await.expect("pruner joined cleanly");
 
         let series = store
-            .query_entity_history("sensor.old", TimeRange::new(0, 10_000).unwrap(), None)
+            .query_entity_history(
+                "sensor.retention_test",
+                TimeRange::new(0, recent_ts + 1_000).unwrap(),
+                None,
+            )
             .await
             .expect("query after prune");
         match series {
-            crate::storage::EntityHistorySeries::Discrete { transitions, .. } => {
-                assert!(transitions.is_empty());
-            }
             crate::storage::EntityHistorySeries::Numeric { points, .. } => {
-                assert!(points.is_empty());
+                assert_eq!(points.len(), 1, "only the expired row should be pruned");
+                assert_eq!(points[0].ts, recent_ts);
+                assert_eq!(points[0].avg, 22.5);
             }
+            other => panic!("expected numeric series with 1 recent row, got {other:?}"),
         }
     }
 }

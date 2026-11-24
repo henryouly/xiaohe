@@ -156,9 +156,7 @@ mod tests {
 
     use super::*;
     use crate::esphome::proto::*;
-    use crate::esphome::transport::{
-        INDICATOR_NOISE, INDICATOR_PLAINTEXT, NOISE_PATTERN, NOISE_PROLOGUE,
-    };
+    use crate::esphome::transport::{INDICATOR_NOISE, INDICATOR_PLAINTEXT};
     use crate::protocol::domain::{Availability, DomainState, SensorValue};
     use crate::state::{EventBus, spawn_history_writer_with_config};
     use crate::storage::{EntityHistorySeries, HistoryStore, SqliteStore, TimeRange};
@@ -188,9 +186,12 @@ mod tests {
                     if msg1.first().copied() != Some(0x00) {
                         return Err("missing 0x00 prefix on client handshake".into());
                     }
-                    let params: snow::params::NoiseParams = NOISE_PATTERN.parse().unwrap();
+                    // Official ESPHome Noise_NNpsk0_25519_ChaChaPoly_SHA256 spec literals
+                    // (independent of production constants so typos in prod constants are caught).
+                    let params: snow::params::NoiseParams =
+                        "Noise_NNpsk0_25519_ChaChaPoly_SHA256".parse().unwrap();
                     let mut responder = snow::Builder::new(params)
-                        .prologue(NOISE_PROLOGUE)
+                        .prologue(b"NoiseAPIInit\0\0")
                         .psk(0, &key)
                         .build_responder()
                         .unwrap();
