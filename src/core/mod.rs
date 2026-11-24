@@ -96,6 +96,7 @@ pub async fn run() -> Result<(), CoreError> {
         history,
         state,
         events,
+        webhooks: Arc::new(system.webhooks),
     });
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
