@@ -1,3 +1,4 @@
+pub mod influxdb;
 pub mod sqlite;
 pub mod types;
 
@@ -5,7 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::config::{StorageBackend, StorageConfig};
+use crate::config::{SecretsConfig, StorageBackend, StorageConfig};
+pub use influxdb::InfluxDbStore;
 pub use sqlite::SqliteStore;
 pub use types::{
     AutomationOutcome, AutomationRunRecord, DiscreteTransition, EntityHistorySeries,
@@ -43,11 +45,27 @@ pub trait HistoryStore: Send + Sync {
 pub async fn build_history_store(
     cfg: &StorageConfig,
 ) -> Result<Arc<dyn HistoryStore>, StorageError> {
+    build_history_store_with_secrets(cfg, &SecretsConfig::default()).await
+}
+
+/// Build the configured `HistoryStore` backend with access to `SecretsConfig` (for InfluxDB tokens).
+pub async fn build_history_store_with_secrets(
+    cfg: &StorageConfig,
+    secrets: &SecretsConfig,
+) -> Result<Arc<dyn HistoryStore>, StorageError> {
     match cfg.backend {
         StorageBackend::Sqlite => {
             let store = SqliteStore::open(&cfg.sqlite.path).await?;
             Ok(Arc::new(store))
         }
-        StorageBackend::InfluxDb => Err(StorageError::UnsupportedBackend("influxdb".to_owned())),
+        StorageBackend::InfluxDb => {
+            let influx_cfg = cfg.influxdb.as_ref().ok_or_else(|| {
+                StorageError::Connection(
+                    "storage.backend is 'influxdb' but [storage.influxdb] is not configured".into(),
+                )
+            })?;
+            let store = InfluxDbStore::from_config(influx_cfg, secrets)?;
+            Ok(Arc::new(store))
+        }
     }
 }

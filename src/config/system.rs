@@ -46,6 +46,27 @@ impl SystemConfig {
         if let Some(socket) = get_env("RUNTIME_SOCKET").filter(|v| !v.is_empty()) {
             self.runtime.socket_path = socket;
         }
+        let influx_url = get_env("INFLUXDB_URL").filter(|v| !v.is_empty());
+        let influx_org = get_env("INFLUXDB_ORG").filter(|v| !v.is_empty());
+        let influx_bucket = get_env("INFLUXDB_BUCKET").filter(|v| !v.is_empty());
+        if influx_url.is_some() || influx_org.is_some() || influx_bucket.is_some() {
+            let cfg = self.storage.influxdb.get_or_insert_with(|| InfluxDbConfig {
+                url: "http://influxdb:8086".to_owned(),
+                database: None,
+                org: Some("xiaohe".to_owned()),
+                bucket: Some("xiaohe".to_owned()),
+                token_secret: None,
+            });
+            if let Some(url) = influx_url {
+                cfg.url = url;
+            }
+            if let Some(org) = influx_org {
+                cfg.org = Some(org);
+            }
+            if let Some(bucket) = influx_bucket {
+                cfg.bucket = Some(bucket);
+            }
+        }
     }
 }
 
