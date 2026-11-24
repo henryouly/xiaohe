@@ -9,3 +9,4 @@ pub mod skills;
 pub mod state;
 pub mod storage;
 pub mod supervisor;
+pub mod validate;

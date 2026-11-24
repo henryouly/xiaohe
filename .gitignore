@@ -24,3 +24,6 @@ sdk/**/__pycache__/
 .DS_Store
 *.swp
 *.swo
+
+**/__pycache__/
+*.pyc

@@ -1,0 +1,44 @@
+[skill]
+id = "device-starter"
+name = "Starter Device Skill"
+version = "0.1.0"
+mode = "device"
+description = "Minimal Xiaohe Device Skill starter template with demo_mode"
+
+[runtime]
+type = "python-uv"
+python = ">=3.11"
+entrypoint = ["python", "src/main.py"]
+heartbeat_interval_secs = 30
+invoke_timeout_secs = 15
+restart_policy = "exponential"
+
+[config.host]
+type = "string"
+required = false
+default = "127.0.0.1"
+description = "Device LAN IP or hostname"
+
+[config.area_id]
+type = "string"
+required = false
+default = "living_room"
+description = "Area ID assigned to registered entities"
+
+[config.poll_interval_secs]
+type = "integer"
+required = false
+default = 15
+min = 1
+max = 300
+description = "Polling interval in seconds"
+
+[config.demo_mode]
+type = "boolean"
+required = false
+default = true
+description = "Run without physical hardware for local testing"
+
+[secrets.api_key]
+required = false
+description = "Optional device API key or token (injected only into this Skill)"
