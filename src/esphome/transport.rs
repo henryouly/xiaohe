@@ -12,6 +12,8 @@ pub const NOISE_PROLOGUE: &[u8] = b"NoiseAPIInit\0\0";
 pub const INDICATOR_PLAINTEXT: u8 = 0x00;
 pub const INDICATOR_NOISE: u8 = 0x01;
 pub const MAX_FRAME_SIZE: usize = 65_536;
+/// Max protobuf payload bytes inside a single Noise frame (65535 - 16-byte AEAD tag - 4-byte header).
+pub const MAX_NOISE_PAYLOAD: usize = 65_535 - 16 - 4;
 
 #[derive(Debug, Error)]
 pub enum EspHomeError {
@@ -27,7 +29,7 @@ pub enum EspHomeError {
     Protocol(String),
     #[error("invalid Noise PSK: {0}")]
     InvalidPsk(String),
-    #[error("frame size {0} exceeds maximum {MAX_FRAME_SIZE}")]
+    #[error("frame size {0} exceeds maximum")]
     FrameTooLarge(usize),
     #[error("invalid command: {0}")]
     InvalidCommand(String),
@@ -49,18 +51,25 @@ pub fn decode_psk(encoded: &str) -> Result<[u8; 32], EspHomeError> {
     })
 }
 
-/// Framed TCP transport for ESPHome Native API (plaintext or Noise `NNpsk0`).
+/// Cancel-safe framed TCP transport for ESPHome Native API (plaintext or Noise `NNpsk0`).
 pub enum EspHomeTransport {
-    Plaintext(TcpStream),
+    Plaintext {
+        stream: TcpStream,
+        read_buf: Vec<u8>,
+    },
     Noise {
         stream: TcpStream,
         state: Box<snow::TransportState>,
+        read_buf: Vec<u8>,
     },
 }
 
 impl EspHomeTransport {
     pub fn plaintext(stream: TcpStream) -> Self {
-        Self::Plaintext(stream)
+        Self::Plaintext {
+            stream,
+            read_buf: Vec::with_capacity(4096),
+        }
     }
 
     /// Perform the official ESPHome `Noise_NNpsk0_25519_ChaChaPoly_SHA256` handshake.
@@ -69,7 +78,7 @@ impl EspHomeTransport {
         write_noise_frame(&mut stream, &[]).await?;
 
         // 2. Read ServerHello frame: [0x01 (protocol), <name>\0, <mac>\0]
-        let server_hello = read_noise_frame(&mut stream).await?;
+        let server_hello = read_noise_frame_exact(&mut stream).await?;
         if server_hello.first().copied() != Some(INDICATOR_NOISE) {
             return Err(EspHomeError::Handshake(format!(
                 "unsupported Noise server hello protocol byte: {:?}",
@@ -97,7 +106,7 @@ impl EspHomeTransport {
         write_noise_frame(&mut stream, &frame1).await?;
 
         // 4. Read server handshake reply: [status, <noise_handshake_msg_2 or error_utf8>]
-        let server_reply = read_noise_frame(&mut stream).await?;
+        let server_reply = read_noise_frame_exact(&mut stream).await?;
         if server_reply.is_empty() {
             return Err(EspHomeError::Handshake(
                 "empty Noise handshake reply".into(),
@@ -122,6 +131,7 @@ impl EspHomeTransport {
         Ok(Self::Noise {
             stream,
             state: Box::new(transport),
+            read_buf: Vec::with_capacity(4096),
         })
     }
 
@@ -135,12 +145,11 @@ impl EspHomeTransport {
         msg.encode(&mut payload)
             .map_err(|e| EspHomeError::Protocol(format!("protobuf encode failed: {e}")))?;
 
-        if payload.len() > MAX_FRAME_SIZE {
-            return Err(EspHomeError::FrameTooLarge(payload.len()));
-        }
-
         match self {
-            Self::Plaintext(stream) => {
+            Self::Plaintext { stream, .. } => {
+                if payload.len() > MAX_FRAME_SIZE {
+                    return Err(EspHomeError::FrameTooLarge(payload.len()));
+                }
                 let mut frame = Vec::with_capacity(1 + 10 + payload.len());
                 frame.push(INDICATOR_PLAINTEXT);
                 encode_varint(payload.len() as u32, &mut frame);
@@ -150,9 +159,11 @@ impl EspHomeTransport {
                 stream.flush().await?;
                 Ok(())
             }
-            Self::Noise { stream, state } => {
-                let payload_len = u16::try_from(payload.len())
-                    .map_err(|_| EspHomeError::FrameTooLarge(payload.len()))?;
+            Self::Noise { stream, state, .. } => {
+                if payload.len() > MAX_NOISE_PAYLOAD {
+                    return Err(EspHomeError::FrameTooLarge(payload.len()));
+                }
+                let payload_len = payload.len() as u16;
                 let mut inner = Vec::with_capacity(4 + payload.len());
                 inner.extend_from_slice(&msg_type.to_be_bytes());
                 inner.extend_from_slice(&payload_len.to_be_bytes());
@@ -168,50 +179,127 @@ impl EspHomeTransport {
     }
 
     /// Receive the next `(msg_type, protobuf_payload)` frame from the device.
+    ///
+    /// This method is **cancel-safe** for use inside `tokio::select!`: partial TCP reads are
+    /// retained in `read_buf` if the future is dropped before a full frame arrives.
     pub async fn recv_frame(&mut self) -> Result<(u16, Vec<u8>), EspHomeError> {
         match self {
-            Self::Plaintext(stream) => {
-                let indicator = read_u8_or_eof(stream).await?;
-                if indicator != INDICATOR_PLAINTEXT {
-                    return Err(EspHomeError::Protocol(format!(
-                        "expected plaintext indicator 0x00, got 0x{indicator:02x}"
-                    )));
+            Self::Plaintext { stream, read_buf } => loop {
+                if let Some(frame) = try_decode_plaintext(read_buf)? {
+                    return Ok(frame);
                 }
-                let payload_len = read_varint(stream).await? as usize;
-                if payload_len > MAX_FRAME_SIZE {
-                    return Err(EspHomeError::FrameTooLarge(payload_len));
+                let n = stream.read_buf(read_buf).await?;
+                if n == 0 {
+                    return Err(EspHomeError::Disconnected);
                 }
-                let msg_type = read_varint(stream).await?;
-                let msg_type = u16::try_from(msg_type).map_err(|_| {
-                    EspHomeError::Protocol(format!("invalid message type {msg_type}"))
-                })?;
-                let mut payload = vec![0u8; payload_len];
-                stream.read_exact(&mut payload).await?;
-                Ok((msg_type, payload))
-            }
-            Self::Noise { stream, state } => {
-                let cipher = read_noise_frame(stream).await?;
-                let mut inner = vec![0u8; cipher.len() + 64];
-                let inner_len = state
-                    .read_message(&cipher, &mut inner)
-                    .map_err(|e| EspHomeError::Noise(format!("decrypt failed: {e}")))?;
-                if inner_len < 4 {
-                    return Err(EspHomeError::Protocol(
-                        "decrypted Noise frame shorter than 4-byte header".into(),
-                    ));
+            },
+            Self::Noise {
+                stream,
+                state,
+                read_buf,
+            } => loop {
+                if let Some(cipher) = try_decode_noise_frame(read_buf)? {
+                    let mut inner = vec![0u8; cipher.len() + 64];
+                    let inner_len = state
+                        .read_message(&cipher, &mut inner)
+                        .map_err(|e| EspHomeError::Noise(format!("decrypt failed: {e}")))?;
+                    if inner_len < 4 {
+                        return Err(EspHomeError::Protocol(
+                            "decrypted Noise frame shorter than 4-byte header".into(),
+                        ));
+                    }
+                    let msg_type = u16::from_be_bytes([inner[0], inner[1]]);
+                    let payload_len = u16::from_be_bytes([inner[2], inner[3]]) as usize;
+                    if 4 + payload_len > inner_len {
+                        return Err(EspHomeError::Protocol(format!(
+                            "decrypted payload length {payload_len} exceeds frame body {}",
+                            inner_len - 4
+                        )));
+                    }
+                    return Ok((msg_type, inner[4..4 + payload_len].to_vec()));
                 }
-                let msg_type = u16::from_be_bytes([inner[0], inner[1]]);
-                let payload_len = u16::from_be_bytes([inner[2], inner[3]]) as usize;
-                if 4 + payload_len > inner_len {
-                    return Err(EspHomeError::Protocol(format!(
-                        "decrypted payload length {payload_len} exceeds frame body {}",
-                        inner_len - 4
-                    )));
+                let n = stream.read_buf(read_buf).await?;
+                if n == 0 {
+                    return Err(EspHomeError::Disconnected);
                 }
-                Ok((msg_type, inner[4..4 + payload_len].to_vec()))
-            }
+            },
         }
     }
+}
+
+fn try_decode_plaintext(buf: &mut Vec<u8>) -> Result<Option<(u16, Vec<u8>)>, EspHomeError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    if buf[0] != INDICATOR_PLAINTEXT {
+        return Err(EspHomeError::Protocol(format!(
+            "expected plaintext indicator 0x00, got 0x{:02x}",
+            buf[0]
+        )));
+    }
+    let Some((payload_len, len_consumed)) = try_decode_varint(&buf[1..])? else {
+        return Ok(None);
+    };
+    let payload_len = payload_len as usize;
+    if payload_len > MAX_FRAME_SIZE {
+        return Err(EspHomeError::FrameTooLarge(payload_len));
+    }
+    let msg_type_start = 1 + len_consumed;
+    let Some((msg_type_u32, type_consumed)) = try_decode_varint(&buf[msg_type_start..])? else {
+        return Ok(None);
+    };
+    let msg_type = u16::try_from(msg_type_u32)
+        .map_err(|_| EspHomeError::Protocol(format!("invalid message type {msg_type_u32}")))?;
+
+    let payload_start = msg_type_start + type_consumed;
+    let total_len = payload_start + payload_len;
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+
+    let payload = buf[payload_start..total_len].to_vec();
+    buf.drain(..total_len);
+    Ok(Some((msg_type, payload)))
+}
+
+fn try_decode_varint(slice: &[u8]) -> Result<Option<(u32, usize)>, EspHomeError> {
+    let mut result: u32 = 0;
+    let mut shift: u32 = 0;
+    for (idx, &byte) in slice.iter().enumerate().take(5) {
+        result |= u32::from(byte & 0x7F) << shift;
+        if (byte & 0x80) == 0 {
+            return Ok(Some((result, idx + 1)));
+        }
+        shift += 7;
+    }
+    if slice.len() >= 5 {
+        Err(EspHomeError::Protocol("varint overflow".into()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_decode_noise_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, EspHomeError> {
+    if buf.len() < 3 {
+        return Ok(None);
+    }
+    if buf[0] != INDICATOR_NOISE {
+        return Err(EspHomeError::Protocol(format!(
+            "expected Noise indicator 0x01, got 0x{:02x}",
+            buf[0]
+        )));
+    }
+    let len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(EspHomeError::FrameTooLarge(len));
+    }
+    let total_len = 3 + len;
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+    let body = buf[3..total_len].to_vec();
+    buf.drain(..total_len);
+    Ok(Some(body))
 }
 
 async fn read_u8_or_eof(stream: &mut TcpStream) -> Result<u8, EspHomeError> {
@@ -223,20 +311,6 @@ async fn read_u8_or_eof(stream: &mut TcpStream) -> Result<u8, EspHomeError> {
         }
         Err(err) => Err(EspHomeError::Io(err)),
     }
-}
-
-async fn read_varint(stream: &mut TcpStream) -> Result<u32, EspHomeError> {
-    let mut result: u32 = 0;
-    let mut shift: u32 = 0;
-    for _ in 0..5 {
-        let byte = read_u8_or_eof(stream).await?;
-        result |= u32::from(byte & 0x7F) << shift;
-        if (byte & 0x80) == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-    }
-    Err(EspHomeError::Protocol("varint overflow".into()))
 }
 
 async fn write_noise_frame(stream: &mut TcpStream, body: &[u8]) -> Result<(), EspHomeError> {
@@ -252,7 +326,7 @@ async fn write_noise_frame(stream: &mut TcpStream, body: &[u8]) -> Result<(), Es
     Ok(())
 }
 
-async fn read_noise_frame(stream: &mut TcpStream) -> Result<Vec<u8>, EspHomeError> {
+async fn read_noise_frame_exact(stream: &mut TcpStream) -> Result<Vec<u8>, EspHomeError> {
     let indicator = read_u8_or_eof(stream).await?;
     if indicator != INDICATOR_NOISE {
         return Err(EspHomeError::Protocol(format!(

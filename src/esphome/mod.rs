@@ -709,4 +709,135 @@ mod tests {
             assert_eq!(mgr.active_node_count(), 0);
         });
     }
+
+    #[tokio::test]
+    async fn recv_frame_is_cancel_safe_under_partial_tcp_reads() {
+        use crate::esphome::transport::EspHomeTransport;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (part2_tx, part2_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let msg = HelloResponse {
+                api_version_major: 1,
+                api_version_minor: 10,
+                server_info: "split-frame-test".into(),
+                name: "esp_split".into(),
+            };
+            let mut payload = Vec::new();
+            msg.encode(&mut payload).unwrap();
+
+            let mut frame = vec![INDICATOR_PLAINTEXT];
+            encode_varint(payload.len() as u32, &mut frame);
+            encode_varint(u32::from(MSG_HELLO_RESPONSE), &mut frame);
+            frame.extend_from_slice(&payload);
+
+            // Send only the first 5 bytes (indicator + len + type + partial payload).
+            sock.write_all(&frame[..5]).await.unwrap();
+            sock.flush().await.unwrap();
+
+            // Wait until the client's first recv_frame future has been cancelled.
+            let _ = part2_rx.await;
+            sock.write_all(&frame[5..]).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut transport = EspHomeTransport::plaintext(stream);
+
+        // Cancel recv_frame mid-frame via select!
+        tokio::select! {
+            _ = transport.recv_frame() => panic!("frame should not be complete yet"),
+            () = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+
+        // Release remaining bytes and verify the full frame decodes cleanly.
+        let _ = part2_tx.send(());
+        let (mt, payload) = transport
+            .recv_frame()
+            .await
+            .expect("recv_frame must survive cancellation");
+        assert_eq!(mt, MSG_HELLO_RESPONSE);
+        let decoded = HelloResponse::decode(payload.as_slice()).unwrap();
+        assert_eq!(decoded.name, "esp_split");
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stalled_handshake_respects_shutdown() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept TCP and intentionally never reply (simulates a hung ESP32).
+        let _server = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let bus = EventBus::new();
+        let state = StateStore::new(bus);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let nodes = vec![EspHomeNodeConfig {
+            id: "esp_hung".into(),
+            host: "127.0.0.1".into(),
+            port,
+            noise_psk_secret: None,
+            area_id: None,
+            enabled: true,
+        }];
+
+        let mgr = EspHomeManager::start_with_config(
+            &nodes,
+            &SecretsConfig::default(),
+            state,
+            shutdown_rx,
+            fast_actor_cfg(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(true);
+
+        tokio::time::timeout(Duration::from_millis(500), mgr.shutdown())
+            .await
+            .expect("node actor should exit promptly on shutdown during stalled handshake");
+    }
+
+    #[tokio::test]
+    async fn noise_send_message_rejects_oversized_payload_as_frame_too_large() {
+        use crate::esphome::transport::EspHomeTransport;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let psk = [0x11_u8; 32];
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _tr = MockTransport::accept(sock, Some(psk)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut transport = EspHomeTransport::connect_noise(stream, psk)
+            .await
+            .expect("noise connect");
+
+        // 65_516 bytes exceeds Noise's 65_535 - 16 (tag) - 4 (header) = 65_515 payload limit.
+        let oversized = HelloRequest {
+            client_info: "x".repeat(65_516),
+            api_version_major: 1,
+            api_version_minor: 10,
+        };
+        let err = transport
+            .send_message(MSG_HELLO_REQUEST, &oversized)
+            .await
+            .expect_err("oversized Noise payload must fail");
+        assert!(
+            matches!(err, EspHomeError::FrameTooLarge(_)),
+            "expected FrameTooLarge, got {err:?}"
+        );
+        server.abort();
+    }
 }

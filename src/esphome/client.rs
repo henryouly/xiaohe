@@ -97,6 +97,10 @@ pub fn make_entity_id(domain: &str, node_id: &str, object_id: &str) -> String {
     )
 }
 
+fn is_shutdown(rx: &watch::Receiver<bool>) -> bool {
+    *rx.borrow() || rx.has_changed().is_err()
+}
+
 /// Long-running actor managing one ESPHome node's TCP/Noise session and reconnection loop.
 pub async fn run_node_actor(
     node: EspHomeNodeConfig,
@@ -112,7 +116,7 @@ pub async fn run_node_actor(
     let mut backoff = cfg.initial_backoff;
 
     loop {
-        if *shutdown_rx.borrow() {
+        if is_shutdown(&shutdown_rx) {
             break;
         }
 
@@ -143,7 +147,7 @@ pub async fn run_node_actor(
         state.set_source_availability(&source, Availability::Offline);
         drain_offline_commands(&node.id, &mut cmd_rx);
 
-        if *shutdown_rx.borrow() {
+        if is_shutdown(&shutdown_rx) {
             break;
         }
 
@@ -177,37 +181,23 @@ pub async fn run_node_actor(
     debug!(node_id = %node.id, "ESPHome node actor stopped");
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_single_session(
+type EstablishedSession = (
+    EspHomeTransport,
+    HashMap<u32, DiscoveredEntity>,
+    HashMap<String, (u32, EntityKind)>,
+);
+
+async fn establish_session(
     node: &EspHomeNodeConfig,
     psk: Option<[u8; 32]>,
     source: &EntitySource,
     state: &StateStore,
-    cmd_rx: &mut mpsc::Receiver<NodeCommand>,
-    shutdown_rx: &mut watch::Receiver<bool>,
-    cfg: NodeActorConfig,
-    backoff: &mut Duration,
-) -> Result<(), EspHomeError> {
-    let stream = tokio::time::timeout(
-        cfg.connect_timeout,
-        TcpStream::connect((node.host.as_str(), node.port)),
-    )
-    .await
-    .map_err(|_| {
-        EspHomeError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "TCP connect timed out",
-        ))
-    })??;
+) -> Result<EstablishedSession, EspHomeError> {
+    let stream = TcpStream::connect((node.host.as_str(), node.port)).await?;
     let _ = stream.set_nodelay(true);
 
     let mut transport = match psk {
-        Some(key) => tokio::time::timeout(
-            cfg.connect_timeout,
-            EspHomeTransport::connect_noise(stream, key),
-        )
-        .await
-        .map_err(|_| EspHomeError::Handshake("Noise handshake timed out".into()))??,
+        Some(key) => EspHomeTransport::connect_noise(stream, key).await?,
         None => EspHomeTransport::plaintext(stream),
     };
 
@@ -259,9 +249,6 @@ async fn run_single_session(
         ));
     }
 
-    // Connection succeeded — reset reconnect backoff.
-    *backoff = cfg.initial_backoff;
-
     // 3. ListEntitiesRequest -> read until ListEntitiesDoneResponse (19)
     transport
         .send_message(MSG_LIST_ENTITIES_REQUEST, &ListEntitiesRequest {})
@@ -301,6 +288,39 @@ async fn run_single_session(
     transport
         .send_message(MSG_SUBSCRIBE_STATES_REQUEST, &SubscribeStatesRequest {})
         .await?;
+
+    Ok((transport, key_map, entity_map))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_session(
+    node: &EspHomeNodeConfig,
+    psk: Option<[u8; 32]>,
+    source: &EntitySource,
+    state: &StateStore,
+    cmd_rx: &mut mpsc::Receiver<NodeCommand>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    cfg: NodeActorConfig,
+    backoff: &mut Duration,
+) -> Result<(), EspHomeError> {
+    let (mut transport, key_map, entity_map) = tokio::select! {
+        biased;
+        changed = shutdown_rx.changed() => {
+            if changed.is_err() || *shutdown_rx.borrow() {
+                return Ok(());
+            }
+            return Ok(());
+        }
+        res = tokio::time::timeout(
+            cfg.connect_timeout,
+            establish_session(node, psk, source, state),
+        ) => {
+            res.map_err(|_| EspHomeError::Handshake("connect/discovery timed out".into()))??
+        }
+    };
+
+    // Connection + discovery succeeded — reset reconnect backoff.
+    *backoff = cfg.initial_backoff;
 
     // 5. Connected event loop: incoming frames, outbound commands, keep-alive pings, shutdown.
     let mut ping_interval = tokio::time::interval(cfg.ping_interval);
@@ -647,7 +667,7 @@ fn apply_state_message(
             if let Some(ent) = key_map.get(&m.key) {
                 let mode = match m.mode {
                     0 => ClimateMode::Off,
-                    1 => ClimateMode::Auto,
+                    1 | 6 => ClimateMode::Auto,
                     2 => ClimateMode::Cool,
                     3 => ClimateMode::Heat,
                     4 => ClimateMode::FanOnly,
@@ -917,5 +937,72 @@ async fn send_entity_command(
         EntityKind::Sensor | EntityKind::BinarySensor => Err(EspHomeError::InvalidCommand(
             format!("entity '{}' is read-only", cmd.entity_id),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::EventBus;
+
+    #[test]
+    fn climate_mode_auto_enum_value_6_maps_to_auto() {
+        let bus = EventBus::new();
+        let state = StateStore::new(bus);
+        let source = EntitySource::EspHome {
+            node_id: "esp_ac".into(),
+        };
+        let node = EspHomeNodeConfig {
+            id: "esp_ac".into(),
+            host: "127.0.0.1".into(),
+            port: 6053,
+            noise_psk_secret: None,
+            area_id: None,
+            enabled: true,
+        };
+
+        let mut disc_payload = Vec::new();
+        ListEntitiesClimateResponse {
+            object_id: "study_ac".into(),
+            key: 55,
+            name: "Study AC".into(),
+        }
+        .encode(&mut disc_payload)
+        .unwrap();
+        let (key, discovered, record) = decode_discovery_message(
+            MSG_LIST_ENTITIES_CLIMATE_RESPONSE,
+            &disc_payload,
+            &node,
+            &source,
+        )
+        .unwrap()
+        .unwrap();
+        state.register_entity(record);
+        let mut key_map = HashMap::new();
+        key_map.insert(key, discovered);
+
+        let mut state_payload = Vec::new();
+        ClimateStateResponse {
+            key: 55,
+            mode: 6, // CLIMATE_MODE_AUTO in official ESPHome api.proto
+            current_temperature: 25.0,
+            target_temperature: 23.0,
+        }
+        .encode(&mut state_payload)
+        .unwrap();
+        apply_state_message(MSG_CLIMATE_STATE_RESPONSE, &state_payload, &key_map, &state).unwrap();
+
+        let rec = state.get("climate.esp_ac_study_ac").unwrap();
+        assert!(
+            matches!(
+                rec.state,
+                DomainState::Climate {
+                    mode: ClimateMode::Auto,
+                    ..
+                }
+            ),
+            "expected ClimateMode::Auto for ESPHome enum value 6, got {:?}",
+            rec.state
+        );
     }
 }
