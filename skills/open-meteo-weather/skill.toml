@@ -1,0 +1,58 @@
+[skill]
+id = "open-meteo-weather"
+name = "Open-Meteo Weather"
+version = "0.1.0"
+mode = "device"
+description = "Fetches current weather from the free Open-Meteo API (no API key required) and publishes typed sensor entities"
+
+[runtime]
+type = "python-uv"
+python = ">=3.11"
+entrypoint = ["python", "src/main.py"]
+heartbeat_interval_secs = 30
+invoke_timeout_secs = 15
+restart_policy = "exponential"
+
+[config.latitude]
+type = "number"
+required = false
+default = 39.9042
+description = "Location latitude in decimal degrees (-90..90)"
+
+[config.longitude]
+type = "number"
+required = false
+default = 116.4074
+description = "Location longitude in decimal degrees (-180..180)"
+
+[config.location_name]
+type = "string"
+required = false
+default = "Beijing"
+description = "Human-readable city or location label shown in the Weather Widget"
+
+[config.area_id]
+type = "string"
+required = false
+default = "outdoor"
+description = "Area ID assigned to weather sensor entities"
+
+[config.poll_interval_secs]
+type = "integer"
+required = false
+default = 600
+min = 30
+max = 3600
+description = "Weather API polling interval in seconds"
+
+[config.demo_mode]
+type = "boolean"
+required = false
+default = false
+description = "Use deterministic simulated weather readings without outbound HTTP requests"
+
+[config.api_base_url]
+type = "string"
+required = false
+default = "https://api.open-meteo.com/v1/forecast"
+description = "Open-Meteo forecast endpoint URL (overrideable for testing or proxies)"

@@ -13,6 +13,7 @@ import {
   type EntityRecord,
 } from "../lib/api";
 import { useXiaohe } from "../lib/store";
+import { WeatherWidget } from "../components/WeatherWidget";
 
 const CLIMATE_MODES: ClimateMode[] = [
   "off",
@@ -585,6 +586,8 @@ export const DashboardView: Component = () => {
           </button>
         </Show>
       </div>
+
+      <WeatherWidget />
 
       <Show when={showAddArea()}>
         <form
