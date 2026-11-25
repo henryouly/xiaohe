@@ -22,7 +22,7 @@ Follow docs/skill_spec.md strictly:
    - skill.toml ([skill], [runtime] with type="python-uv" and entrypoint=["python", "src/main.py"], [config.*], [secrets.*], and [actions.*] for action skills)
    - pyproject.toml (PEP 621 dependencies managed by uv)
    - src/main.py using xiaohe_sdk.SkillApp (JSON-RPC 2.0 over stdin/stdout; NEVER print logs to stdout, use stderr only!)
-   - SKILL.md documenting config fields, secrets, entities/actions, and demo_mode testing
+   - SKILL.md starting with YAML frontmatter (`name` matching `[skill].id` and `description`), documenting config fields, secrets, entities/actions, and demo_mode testing
 2. For Device Skills:
    - Register entities in @app.on_init via await app.register_entities(device={...}, entities=[...])
    - Emit state updates via await app.emit_state(entity_id, domain_state_dict)

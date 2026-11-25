@@ -1,3 +1,8 @@
+---
+name: open-meteo-weather
+description: Fetches current weather from the free Open-Meteo API (no API key required) and publishes typed sensor entities into Xiaohe Core.
+---
+
 # Open-Meteo Weather Skill
 
 Fetches live weather data from the free [Open-Meteo API](https://open-meteo.com/) (no API key required) and publishes typed `sensor` entities into Xiaohe Core so they are stored in `HistoryStore` (SQLite / InfluxDB), streamed over SSE, and rendered in the Web UI Weather Widget.

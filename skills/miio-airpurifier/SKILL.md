@@ -1,3 +1,8 @@
+---
+name: miio-airpurifier
+description: Long-running Device Skill for Xiaomi Air Purifier via python-miio (with demo_mode for hardware-free testing).
+---
+
 # Xiaomi Air Purifier (`miio-airpurifier`)
 
 Reference **long-running Device Skill** (`mode = "device"`) demonstrating how to wrap a LAN IoT library (`python-miio`) inside an isolated `uv` Python process using `xiaohe-sdk`.

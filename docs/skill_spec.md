@@ -20,7 +20,14 @@ Skills live under `/skills/<skill_id>/` (mounted into `xiaohe-runtime`):
 
 ### Why Both `skill.toml` and `SKILL.md`?
 - **`skill.toml`** is strictly parsed by `xiaohe-supervisor` and `xiaohe-core` to provision dependencies, generate the Skill Manager configuration form, inject scoped secrets, and route commands.
-- **`SKILL.md`** documents hardware quirks, pairing steps (e.g., how to obtain a MiHome token), third-party library caveats, and expected entity schemas so both humans and AI coding agents can maintain or extend the Skill without reverse-engineering source code.
+- **`SKILL.md`** documents hardware quirks, pairing steps (e.g., how to obtain a MiHome token), third-party library caveats, and expected entity schemas so both humans and AI agents can discover, maintain, or extend the Skill without reverse-engineering source code. Every `SKILL.md` should begin with Agent-Skills-compatible YAML frontmatter (`name` matching `[skill].id` in `skill.toml`, plus a concise `description`), verified offline by `xiaohe validate`:
+
+```markdown
+---
+name: miio-airpurifier
+description: Long-running Device Skill for Xiaomi Air Purifier via python-miio.
+---
+```
 
 ---
 

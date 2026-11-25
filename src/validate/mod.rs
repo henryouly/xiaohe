@@ -291,6 +291,7 @@ pub fn validate_workspace(
             report.skills_checked = skills.len() + errors.len();
             for skill in &skills {
                 ctx.known_skills.insert(skill.manifest.skill.id.clone());
+                check_skill_markdown(&skill.dir, &skill.manifest.skill.id, &mut report);
             }
             for err in errors {
                 report.error(sdir.display().to_string(), err.to_string());
@@ -340,6 +341,104 @@ fn check_sensitive_file_mode(path: &Path, label: &str, report: &mut ValidationRe
 
 #[cfg(not(unix))]
 fn check_sensitive_file_mode(_path: &Path, _label: &str, _report: &mut ValidationReport) {}
+
+fn strip_yaml_scalar(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+fn check_skill_markdown(skill_dir: &Path, expected_id: &str, report: &mut ValidationReport) {
+    let md_path = skill_dir.join("SKILL.md");
+    let source = md_path.display().to_string();
+    if !md_path.is_file() {
+        report.warn(
+            source,
+            "missing SKILL.md guide with YAML frontmatter (name, description)",
+        );
+        return;
+    }
+
+    let raw = match std::fs::read_to_string(&md_path) {
+        Ok(content) => content,
+        Err(err) => {
+            report.error(source, format!("failed to read SKILL.md: {err}"));
+            return;
+        }
+    };
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        report.error(
+            source,
+            "SKILL.md must begin with YAML frontmatter delimited by '---'",
+        );
+        return;
+    }
+
+    let mut closed = false;
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            closed = true;
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let val = strip_yaml_scalar(value).trim();
+            match key {
+                "name" => name = Some(val.to_string()),
+                "description" => description = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    if !closed {
+        report.error(
+            source,
+            "SKILL.md YAML frontmatter is missing closing '---' delimiter",
+        );
+        return;
+    }
+
+    match name.as_deref() {
+        None | Some("") => {
+            report.error(
+                source.clone(),
+                "SKILL.md frontmatter is missing required 'name' field",
+            );
+        }
+        Some(actual) if actual != expected_id => {
+            report.error(
+                source.clone(),
+                format!(
+                    "SKILL.md frontmatter name '{actual}' does not match skill.toml id '{expected_id}'"
+                ),
+            );
+        }
+        Some(_) => {}
+    }
+
+    if description.as_deref().is_none_or(|d| d.trim().is_empty()) {
+        report.error(
+            source,
+            "SKILL.md frontmatter is missing required 'description' field",
+        );
+    }
+}
 
 /// Format a `ValidationReport` for CLI stdout (either human-readable or JSON).
 pub fn format_report(report: &ValidationReport, json: bool) -> String {
@@ -489,5 +588,58 @@ name = "Bad"
                 .any(|d| d.level == DiagnosticLevel::Error
                     && d.message.contains("skills directory does not exist"))
         );
+    }
+
+    #[test]
+    fn validates_skill_markdown_frontmatter() {
+        let cfg = tempfile::TempDir::new().expect("cfg tempdir");
+        let skills_root = tempfile::TempDir::new().expect("skills tempdir");
+        let skill_dir = skills_root.path().join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+[skill]
+id = "demo-skill"
+name = "Demo Skill"
+version = "0.1.0"
+mode = "device"
+description = "Demo"
+
+[runtime]
+type = "executable"
+entrypoint = ["/bin/true"]
+"#,
+        )
+        .unwrap();
+
+        // Missing SKILL.md -> warning only, still valid
+        let rep_missing = validate_workspace(cfg.path(), Some(skills_root.path()));
+        assert!(rep_missing.is_valid(), "got: {:?}", rep_missing.diagnostics);
+        assert_eq!(rep_missing.warning_count(), 1);
+
+        // Missing frontmatter -> error
+        std::fs::write(skill_dir.join("SKILL.md"), "# Demo Skill\n").unwrap();
+        let rep_no_fm = validate_workspace(cfg.path(), Some(skills_root.path()));
+        assert!(!rep_no_fm.is_valid());
+
+        // Mismatched name & missing description -> 2 errors
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: wrong-id\n---\n# Demo Skill\n",
+        )
+        .unwrap();
+        let rep_bad = validate_workspace(cfg.path(), Some(skills_root.path()));
+        assert_eq!(rep_bad.error_count(), 2, "got: {:?}", rep_bad.diagnostics);
+
+        // Valid frontmatter -> 0 errors, 0 warnings
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: \"Valid demo skill.\"\n---\n\n# Demo Skill\n",
+        )
+        .unwrap();
+        let rep_ok = validate_workspace(cfg.path(), Some(skills_root.path()));
+        assert!(rep_ok.is_valid(), "got: {:?}", rep_ok.diagnostics);
+        assert_eq!(rep_ok.warning_count(), 0);
     }
 }
