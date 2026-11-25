@@ -1,3 +1,8 @@
+---
+name: device-starter
+description: Minimal Xiaohe Device Skill starter template with demo_mode support.
+---
+
 # Starter Device Skill
 
 Copy this folder into `skills/<your-skill-id>/`, update `[skill]` in `skill.toml`, and add third-party device libraries to `pyproject.toml`.

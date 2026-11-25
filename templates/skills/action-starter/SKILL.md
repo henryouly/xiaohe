@@ -1,3 +1,8 @@
+---
+name: action-starter
+description: Minimal Xiaohe on-demand Action Skill starter template.
+---
+
 # Starter Action Skill
 
 Copy this folder into `skills/<your-skill-id>/`, update `[skill]` and `[actions.*]` in `skill.toml`, and implement your routine in `src/main.py`.

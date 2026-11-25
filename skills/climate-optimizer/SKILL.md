@@ -1,3 +1,8 @@
+---
+name: climate-optimizer
+description: On-demand Action Skill that computes indoor heat index from Core sensor entities and optionally triggers a cooling or purifier switch.
+---
+
 # Climate Comfort Optimizer (`climate-optimizer`)
 
 Reference **on-demand Action Skill** (`mode = "action"`) demonstrating how automations or operators invoke isolated Python logic that calls back into `xiaohe core` via `core.get_entity` and `core.call_entity`.
