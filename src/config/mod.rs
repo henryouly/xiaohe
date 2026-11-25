@@ -1,4 +1,5 @@
 pub mod areas;
+pub mod dashboard;
 pub mod devices;
 pub mod secrets;
 pub mod system;
@@ -14,6 +15,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 pub use areas::{AreaConfig, AreasConfig};
+pub use dashboard::{DashboardConfig, DashboardWidget, WidgetConfig, WidgetSize};
 pub use devices::{DevicesConfig, EspHomeConfig, EspHomeNodeConfig, SkillUserConfig};
 pub use secrets::SecretsConfig;
 pub use system::{
@@ -24,6 +26,7 @@ pub use users::{AllowedAreas, ApiTokenConfig, UserConfig, UserRole, UsersConfig}
 
 pub const SYSTEM_FILE: &str = "system.toml";
 pub const AREAS_FILE: &str = "areas.toml";
+pub const DASHBOARD_FILE: &str = "dashboard.toml";
 pub const USERS_FILE: &str = "users.toml";
 pub const DEVICES_FILE: &str = "devices.toml";
 pub const SECRETS_FILE: &str = "secrets.toml";
@@ -94,6 +97,18 @@ impl ConfigStore {
 
     pub fn save_areas(&self, cfg: &AreasConfig) -> Result<(), ConfigError> {
         self.save_toml(AREAS_FILE, cfg, false)
+    }
+
+    pub fn load_dashboard(&self) -> Result<DashboardConfig, ConfigError> {
+        let path = self.config_dir.join(DASHBOARD_FILE);
+        if !path.exists() {
+            return Ok(DashboardConfig::default_layout());
+        }
+        self.load_or_default(DASHBOARD_FILE, false)
+    }
+
+    pub fn save_dashboard(&self, cfg: &DashboardConfig) -> Result<(), ConfigError> {
+        self.save_toml(DASHBOARD_FILE, cfg, false)
     }
 
     pub fn load_users(&self) -> Result<UsersConfig, ConfigError> {

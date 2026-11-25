@@ -66,6 +66,18 @@ pub fn build_openapi() -> OpenApi {
             "Areas",
         ),
         (
+            "/api/dashboard",
+            HttpMethod::Get,
+            "Get Dashboard widget layout",
+            "Dashboard",
+        ),
+        (
+            "/api/dashboard",
+            HttpMethod::Put,
+            "Update Dashboard widget layout (Admin)",
+            "Dashboard",
+        ),
+        (
             "/api/entities",
             HttpMethod::Get,
             "List entities filtered by RBAC allowed_areas",

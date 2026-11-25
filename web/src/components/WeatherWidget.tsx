@@ -59,7 +59,9 @@ const WeatherIcon: Component<{ kind: WeatherIconKind }> = (props) => {
   }
 };
 
-export const WeatherWidget: Component = () => {
+export const WeatherWidget: Component<{ showEmptyState?: boolean }> = (
+  props,
+) => {
   const store = useXiaohe();
   const [refreshing, setRefreshing] = createSignal(false);
 
@@ -83,7 +85,22 @@ export const WeatherWidget: Component = () => {
   };
 
   return (
-    <Show when={weather()}>
+    <Show
+      when={weather()}
+      fallback={
+        <Show when={props.showEmptyState}>
+          <div class="rounded-2xl border border-dashed border-sky-500/30 bg-slate-900/60 p-5 text-xs text-slate-400">
+            Weather widget is waiting for{" "}
+            <span class="font-mono text-sky-300">open-meteo-weather</span>{" "}
+            sensor entities. Enable it in{" "}
+            <A href="/skills" class="text-sky-300 underline">
+              Skills
+            </A>
+            .
+          </div>
+        </Show>
+      }
+    >
       {(w) => (
         <section class="relative overflow-hidden rounded-2xl border border-sky-500/25 bg-gradient-to-br from-sky-950/60 via-slate-900/90 to-slate-900 p-5 shadow-lg">
           <div class="flex flex-wrap items-center justify-between gap-4">

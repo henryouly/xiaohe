@@ -455,4 +455,79 @@ export const api = {
       `/api/automations/runs${suffix}`,
     );
   },
+
+  // Dashboard Layout
+  getDashboard: () => request<DashboardConfig>("/api/dashboard"),
+  saveDashboard: (config: DashboardConfig) =>
+    request<DashboardConfig>("/api/dashboard", {
+      method: "PUT",
+      body: JSON.stringify(config),
+    }),
 };
+
+export type WidgetSize = "sm" | "md" | "lg";
+
+export type WidgetAccent = "emerald" | "sky" | "amber" | "rose" | "violet";
+
+export type DashboardWidgetBase = {
+  id: string;
+  title?: string;
+  size: WidgetSize;
+};
+
+export type MetricWidgetConfig = DashboardWidgetBase & {
+  type: "metric";
+  entity_id: string;
+  accent?: WidgetAccent;
+  warn_above?: number;
+  crit_above?: number;
+};
+
+export type SparklineWidgetConfig = DashboardWidgetBase & {
+  type: "sparkline";
+  entity_id: string;
+  window_hours?: number;
+  accent?: WidgetAccent;
+};
+
+export type EntityCardWidgetConfig = DashboardWidgetBase & {
+  type: "entity_card";
+  entity_id: string;
+};
+
+export type WeatherWidgetConfig = DashboardWidgetBase & {
+  type: "weather";
+  prefix?: string;
+};
+
+export type EntityListWidgetConfig = DashboardWidgetBase & {
+  type: "entity_list";
+  area_id?: string;
+  domain?: string;
+  entity_ids?: string[];
+};
+
+export type AreaGroupWidgetConfig = DashboardWidgetBase & {
+  type: "area_group";
+  area_id?: string;
+};
+
+export type SystemStatusWidgetConfig = DashboardWidgetBase & {
+  type: "system_status";
+};
+
+export type DashboardWidget =
+  | MetricWidgetConfig
+  | SparklineWidgetConfig
+  | EntityCardWidgetConfig
+  | WeatherWidgetConfig
+  | EntityListWidgetConfig
+  | AreaGroupWidgetConfig
+  | SystemStatusWidgetConfig;
+
+export type WidgetType = DashboardWidget["type"];
+
+export interface DashboardConfig {
+  widgets: DashboardWidget[];
+}
+

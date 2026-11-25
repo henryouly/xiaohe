@@ -1,6 +1,7 @@
 pub mod areas;
 pub mod auth;
 pub mod automations;
+pub mod dashboard;
 pub mod entities;
 pub mod events;
 pub mod openapi;
@@ -87,6 +88,11 @@ pub fn build_router_with_spa(state: AppState, web_dist_dir: Option<PathBuf>) -> 
         .route(
             "/api/areas/{area_id}",
             put(areas::update_area).delete(areas::delete_area),
+        )
+        // Dashboard Layout
+        .route(
+            "/api/dashboard",
+            get(dashboard::get_dashboard).put(dashboard::update_dashboard),
         )
         // Entities & History
         .route("/api/entities", get(entities::list_entities))
@@ -1857,5 +1863,133 @@ action = "turn_on"
             .await
             .unwrap();
         assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_api_rbac_and_persistence() {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("sqlite"));
+        let fixture = test_fixture(store, vec![], false).await;
+        let app = build_router(fixture.state.clone());
+
+        // Unauthenticated request -> 401
+        let unauth = app
+            .clone()
+            .oneshot(Request::get("/api/dashboard").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let admin_cookie = bootstrap_admin_cookie(&app).await;
+        let member_token =
+            create_user_and_token(&app, &admin_cookie, "alice", "member", &["living_room"]).await;
+
+        // Default layout returned before dashboard.toml exists
+        let get_default = app
+            .clone()
+            .oneshot(
+                Request::get("/api/dashboard")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_default.status(), StatusCode::OK);
+        let default_json = json_body(get_default).await;
+        assert!(default_json["widgets"].as_array().unwrap().len() >= 2);
+
+        // Member cannot PUT /api/dashboard -> 403
+        let new_layout = json!({
+            "widgets": [
+                {
+                    "id": "pm25-kpi",
+                    "title": "Living Room PM2.5",
+                    "size": "sm",
+                    "type": "metric",
+                    "entity_id": "sensor.purifier_pm25",
+                    "accent": "emerald",
+                    "warn_above": 35.0,
+                    "crit_above": 75.0
+                },
+                {
+                    "id": "temp-trend",
+                    "title": "Temperature 24h",
+                    "size": "md",
+                    "type": "sparkline",
+                    "entity_id": "sensor.weather_temperature",
+                    "window_hours": 24
+                }
+            ]
+        });
+        let member_put = app
+            .clone()
+            .oneshot(
+                Request::put("/api/dashboard")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(new_layout.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(member_put.status(), StatusCode::FORBIDDEN);
+
+        // Admin invalid layout (duplicate id) -> 400
+        let bad_layout = json!({
+            "widgets": [
+                {"id": "dup", "size": "sm", "type": "system_status"},
+                {"id": "dup", "size": "md", "type": "weather"}
+            ]
+        });
+        let bad_put = app
+            .clone()
+            .oneshot(
+                Request::put("/api/dashboard")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(bad_layout.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_put.status(), StatusCode::BAD_REQUEST);
+
+        // Admin valid PUT persists to config/dashboard.toml and is readable by Member
+        let ok_put = app
+            .clone()
+            .oneshot(
+                Request::put("/api/dashboard")
+                    .header("cookie", &admin_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(new_layout.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_put.status(), StatusCode::OK);
+        assert!(
+            fixture
+                .state
+                .config_store
+                .config_dir()
+                .join("dashboard.toml")
+                .is_file()
+        );
+
+        let get_saved = app
+            .clone()
+            .oneshot(
+                Request::get("/api/dashboard")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_saved.status(), StatusCode::OK);
+        let saved_json = json_body(get_saved).await;
+        assert_eq!(saved_json["widgets"].as_array().unwrap().len(), 2);
+        assert_eq!(saved_json["widgets"][0]["id"], "pm25-kpi");
+        assert_eq!(saved_json["widgets"][1]["window_hours"], 24);
     }
 }
