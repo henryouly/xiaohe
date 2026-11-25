@@ -203,6 +203,22 @@ pub fn validate_workspace(
         Err(err) => report.error("areas.toml", err.to_string()),
     }
 
+    // 2b. dashboard.toml (optional)
+    let dashboard_path = config_dir.join("dashboard.toml");
+    if dashboard_path.exists() {
+        report.checked_files += 1;
+        match store.load_dashboard() {
+            Ok(dashboard) => {
+                if let Err(errors) = dashboard.validate() {
+                    for msg in errors {
+                        report.error("dashboard.toml", msg);
+                    }
+                }
+            }
+            Err(err) => report.error("dashboard.toml", err.to_string()),
+        }
+    }
+
     // 3. devices.toml
     let devices_path = config_dir.join("devices.toml");
     if devices_path.exists() {
